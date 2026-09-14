@@ -5,21 +5,42 @@ import json
 from io import BytesIO
 from typing import Protocol
 
+from prvr_agent.llm_config import LLMConfig, create_openai_compatible_client
 from prvr_agent.schemas import Candidate, EvidenceResult, QueryHypothesisGraph
 from prvr_agent.video.sampler import DecordFrameSampler, TimeWindow
 
 
 class EvidenceBackend(Protocol):
-    def verify(self, *, query: str, graph: QueryHypothesisGraph, candidate: Candidate, video_path: str, window: TimeWindow, mode: str, num_frames: int) -> EvidenceResult: ...
+    def verify(
+        self,
+        *,
+        query: str,
+        graph: QueryHypothesisGraph,
+        candidate: Candidate,
+        video_path: str,
+        window: TimeWindow,
+        mode: str,
+        num_frames: int,
+    ) -> EvidenceResult: ...
 
 
 class OpenAIFrameEvidenceBackend:
-    """Raw-frame verifier with PRVR-specific structured output."""
+    """Raw-frame verifier backed by an OpenAI-compatible multimodal server.
 
-    def __init__(self, client, model: str) -> None:
-        self.client = client
-        self.model = model
+    The default configuration targets the local Qwen3-VL vLLM endpoint defined
+    by :class:`prvr_agent.llm_config.LLMConfig`.
+    """
+
+    def __init__(self, client=None, model: str | None = None, *, config: LLMConfig | None = None) -> None:
+        cfg = config or LLMConfig.from_env()
+        self.client = client or create_openai_compatible_client(cfg)
+        self.model = model or cfg.model
+        self.temperature = cfg.temperature
         self._samplers: dict[str, DecordFrameSampler] = {}
+
+    @classmethod
+    def from_env(cls) -> "OpenAIFrameEvidenceBackend":
+        return cls(config=LLMConfig.from_env())
 
     @staticmethod
     def _frame_to_data_url(frame) -> str:
@@ -32,7 +53,17 @@ class OpenAIFrameEvidenceBackend:
         image.save(buf, format="JPEG", quality=85)
         return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
-    def verify(self, *, query: str, graph: QueryHypothesisGraph, candidate: Candidate, video_path: str, window: TimeWindow, mode: str, num_frames: int = 8) -> EvidenceResult:
+    def verify(
+        self,
+        *,
+        query: str,
+        graph: QueryHypothesisGraph,
+        candidate: Candidate,
+        video_path: str,
+        window: TimeWindow,
+        mode: str,
+        num_frames: int = 8,
+    ) -> EvidenceResult:
         if mode not in {"support", "refute"}:
             raise ValueError("mode must be 'support' or 'refute'")
         sampler = self._samplers.get(video_path)
@@ -47,14 +78,19 @@ class OpenAIFrameEvidenceBackend:
             if mode == "support"
             else "Act as a falsifier: search for counterfactual or contradictory evidence showing this is a semantic near-miss."
         )
-        content: list[dict] = [{"type": "text", "text": (
-            f"PRVR query: {query}\nCandidate video: {candidate.video_id}\n"
-            f"Inspection window: {window.start:.2f}s-{window.end:.2f}s\nMode: {mode}\n"
-            f"Task: {task}\nHypothesis graph:\n{graph_json}\n\n"
-            "Evaluate only observable evidence. Do not infer hidden intent or unseen causes. "
-            "Return calibrated support/contradiction values and explicitly judge event completeness, "
-            "entity consistency, and temporal consistency."
-        )}]
+        content: list[dict] = [
+            {
+                "type": "text",
+                "text": (
+                    f"PRVR query: {query}\nCandidate video: {candidate.video_id}\n"
+                    f"Inspection window: {window.start:.2f}s-{window.end:.2f}s\nMode: {mode}\n"
+                    f"Task: {task}\nHypothesis graph:\n{graph_json}\n\n"
+                    "Evaluate only observable evidence. Do not infer hidden intent or unseen causes. "
+                    "Return calibrated support/contradiction values and explicitly judge event completeness, "
+                    "entity consistency, and temporal consistency."
+                ),
+            }
+        ]
         for ts, frame in zip(timestamps, frames):
             content.append({"type": "text", "text": f"Timestamp: {ts:.2f}s"})
             content.append({"type": "image_url", "image_url": {"url": self._frame_to_data_url(frame)}})
@@ -65,7 +101,7 @@ class OpenAIFrameEvidenceBackend:
                 {"role": "system", "content": "You are a conservative visual evidence verifier for video retrieval."},
                 {"role": "user", "content": content},
             ],
-            temperature=0.1,
+            temperature=self.temperature,
             response_format={"type": "json_object"},
         )
         raw = response.choices[0].message.content or "{}"
