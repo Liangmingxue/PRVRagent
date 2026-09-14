@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Virtual environments / local environment files
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Secrets / private keys
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime outputs and logs
+logs/
+outputs/
+runs/
+wandb/
+*.log
+
+# Large local research assets
+checkpoints/
+ckpt/
+data/
+datasets/
+features/
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.hdf5
+
+# Temporary media/evidence dumps
+*.tmp
+*.cache
+frames_cache/
+evidence_cache/
