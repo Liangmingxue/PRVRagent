@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from statistics import mean
 from typing import Optional, Set
 
 from .schemas import EvidenceResult
@@ -82,8 +81,15 @@ def summarize_evidence(
     )
 
 
-def _positive_confidence(v: VerificationScore) -> float:
-    return mean((v.atomic, v.temporal, v.identity, v.completeness))
+def verification_score(v: VerificationScore, cfg: ScoreFusionConfig) -> float:
+    positive = (
+        cfg.atomic_weight * v.atomic
+        + cfg.temporal_weight * v.temporal
+        + cfg.identity_weight * v.identity
+        + cfg.completeness_weight * v.completeness
+    )
+    negative = cfg.contradiction_weight * v.contradiction + cfg.uncertainty_penalty * v.uncertainty
+    return positive - negative
 
 
 def aggregate_evidence(
@@ -93,7 +99,16 @@ def aggregate_evidence(
     expected_event_ids: Optional[Set[str]] = None,
     expected_temporal_ids: Optional[Set[str]] = None,
     expected_identity_ids: Optional[Set[str]] = None,
+    score_config: Optional[ScoreFusionConfig] = None,
 ) -> VerificationScore:
+    """Pool inspected moments with PRVR's existential semantics.
+
+    A video is relevant when *one coherent local moment* satisfies the query. We
+    therefore score each support/refute round as a whole and keep the best local
+    moment. Evidence from different temporal windows is never mixed component-wise,
+    and a near-miss in one window cannot contradict a verified match in another.
+    """
+
     if not supports or not refutes or len(supports) != len(refutes):
         raise ValueError("support/refute evidence must be non-empty and aligned by round")
     per_round = [
@@ -106,27 +121,8 @@ def aggregate_evidence(
         )
         for support, refute in zip(supports, refutes)
     ]
-
-    best = max(per_round, key=lambda value: _positive_confidence(value) - 0.25 * value.uncertainty)
-    return VerificationScore(
-        atomic=best.atomic,
-        temporal=best.temporal,
-        identity=best.identity,
-        completeness=best.completeness,
-        contradiction=max(v.contradiction for v in per_round),
-        uncertainty=mean(v.uncertainty for v in per_round),
-    )
-
-
-def verification_score(v: VerificationScore, cfg: ScoreFusionConfig) -> float:
-    positive = (
-        cfg.atomic_weight * v.atomic
-        + cfg.temporal_weight * v.temporal
-        + cfg.identity_weight * v.identity
-        + cfg.completeness_weight * v.completeness
-    )
-    negative = cfg.contradiction_weight * v.contradiction + cfg.uncertainty_penalty * v.uncertainty
-    return positive - negative
+    cfg = score_config or ScoreFusionConfig()
+    return max(per_round, key=lambda value: verification_score(value, cfg))
 
 
 def fuse_candidate_score(base_score: float, verification: VerificationScore, cfg: ScoreFusionConfig) -> float:
