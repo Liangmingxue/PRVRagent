@@ -46,6 +46,7 @@ class CandidateEvidenceState:
     round_idx: int = 0
     retrieval_margin: float = 0.0
     peak_gap_seconds: float = 0.0
+    min_rounds_before_negative_stop: int = 1
 
     def add_round(self, interval: tuple[float, float], support: EvidenceResult, refute: EvidenceResult) -> None:
         self.round_idx += 1
@@ -100,7 +101,8 @@ def decide_next_action(
 
     pos = positive_confidence(score)
     if (
-        score.uncertainty <= cfg.early_stop_uncertainty
+        state.round_idx >= state.min_rounds_before_negative_stop
+        and score.uncertainty <= cfg.early_stop_uncertainty
         and score.contradiction >= cfg.reject_contradiction
         and pos <= cfg.reject_positive_max
     ):
