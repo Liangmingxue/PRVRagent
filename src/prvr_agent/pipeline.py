@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional, Tuple
 
 from .agents.hypothesis_planner import HypothesisPlanner
 from .agents.verifier import EvidenceBackend
@@ -14,18 +14,38 @@ from .video.sampler import TimeWindow
 
 @dataclass(frozen=True)
 class PeakMappingConfig:
-    frame_seconds_per_index: float | None = None
-    clip_seconds_per_index: float | None = None
+    """Map DreamPRVR feature locations to raw-video time.
+
+    In ``auto`` mode, fixed strides are used only when both are supplied. Otherwise
+    the mapper uses relative bin centers plus the raw-video duration. Relative mode
+    matches DreamPRVR's public preprocessing, which uniformly/averagely resamples
+    each video's feature sequence instead of using one global seconds-per-index.
+    """
+
+    mode: str = "auto"
+    frame_seconds_per_index: Optional[float] = None
+    clip_seconds_per_index: Optional[float] = None
+
+    def resolved_mode(self) -> str:
+        if self.mode not in {"auto", "relative", "fixed_stride"}:
+            raise ValueError("peak mapping mode must be auto, relative, or fixed_stride")
+        if self.mode == "auto":
+            if self.frame_seconds_per_index is None and self.clip_seconds_per_index is None:
+                return "relative"
+            if self.frame_seconds_per_index is not None and self.clip_seconds_per_index is not None:
+                return "fixed_stride"
+            raise ValueError("set both fixed strides or neither")
+        return self.mode
 
     def validate(self) -> None:
-        for name, value in (
-            ("frame_seconds_per_index", self.frame_seconds_per_index),
-            ("clip_seconds_per_index", self.clip_seconds_per_index),
-        ):
-            if value is None or value <= 0:
-                raise ValueError(
-                    f"{name} must be configured from the dataset feature-extraction pipeline before verification"
-                )
+        mode = self.resolved_mode()
+        if mode == "fixed_stride":
+            for name, value in (
+                ("frame_seconds_per_index", self.frame_seconds_per_index),
+                ("clip_seconds_per_index", self.clip_seconds_per_index),
+            ):
+                if value is None or not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"{name} must be finite and positive in fixed_stride mode")
 
 
 @dataclass(frozen=True)
@@ -50,9 +70,9 @@ class PRVRAgentReranker:
         self,
         planner: HypothesisPlanner,
         evidence_backend: EvidenceBackend,
-        video_path_resolver: Callable[[str], str | Path],
+        video_path_resolver: Callable[[str], object],
         *,
-        cfg: PipelineConfig | None = None,
+        cfg: Optional[PipelineConfig] = None,
     ) -> None:
         self.planner = planner
         self.evidence_backend = evidence_backend
@@ -64,50 +84,124 @@ class PRVRAgentReranker:
         if self.cfg.frames_per_round <= 0:
             raise ValueError("frames_per_round must be positive")
 
-    def _peak_times(self, candidate: Candidate) -> tuple[float, float]:
-        mapping = self.cfg.peak_mapping
-        assert mapping.clip_seconds_per_index is not None
-        assert mapping.frame_seconds_per_index is not None
-        return (
-            candidate.clip_peak_index * mapping.clip_seconds_per_index,
-            candidate.frame_peak_index * mapping.frame_seconds_per_index,
-        )
+    def _video_duration(self, video_path: str) -> float:
+        duration_fn = getattr(self.evidence_backend, "video_duration", None)
+        if not callable(duration_fn):
+            raise ValueError(
+                "relative peak mapping requires an evidence backend exposing video_duration(video_path); "
+                "otherwise configure fixed_stride peak mapping"
+            )
+        duration = float(duration_fn(video_path))
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError(f"invalid video duration {duration!r} for {video_path}")
+        return duration
 
-    def _window(self, seed: float, round_idx: int) -> TimeWindow:
-        width = self.cfg.budget.initial_window_seconds * (self.cfg.budget.expansion_factor ** round_idx)
-        return TimeWindow(max(0.0, seed - width / 2), seed + width / 2)
+    @staticmethod
+    def _relative_time(index: int, count: int, duration: float, name: str) -> float:
+        if count <= 0:
+            raise ValueError(f"{name} location count must be positive")
+        if index < 0 or index >= count:
+            raise ValueError(f"{name} peak index {index} is outside valid location count {count}")
+        return ((index + 0.5) / count) * duration
+
+    def _peak_times(self, candidate: Candidate, video_path: str) -> Tuple[float, float, Optional[float]]:
+        mapping = self.cfg.peak_mapping
+        mode = mapping.resolved_mode()
+        if mode == "fixed_stride":
+            assert mapping.clip_seconds_per_index is not None
+            assert mapping.frame_seconds_per_index is not None
+            return (
+                candidate.clip_peak_index * mapping.clip_seconds_per_index,
+                candidate.frame_peak_index * mapping.frame_seconds_per_index,
+                None,
+            )
+
+        duration = self._video_duration(video_path)
+        try:
+            clip_count = int(candidate.metadata["clip_num_locations"])
+            frame_count = int(candidate.metadata["frame_valid_locations"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "relative peak mapping requires candidate metadata 'clip_num_locations' and "
+                "'frame_valid_locations'; obtain candidates from DreamPRVRAdapter"
+            ) from exc
+        return (
+            self._relative_time(candidate.clip_peak_index, clip_count, duration, "clip"),
+            self._relative_time(candidate.frame_peak_index, frame_count, duration, "frame"),
+            duration,
+        )
 
     @staticmethod
     def _local_margin(sorted_candidates: list[Candidate], idx: int) -> float:
-        gaps: list[float] = []
+        gaps = []
         if idx > 0:
             gaps.append(abs(sorted_candidates[idx - 1].base_score - sorted_candidates[idx].base_score))
         if idx + 1 < len(sorted_candidates):
             gaps.append(abs(sorted_candidates[idx].base_score - sorted_candidates[idx + 1].base_score))
         return min(gaps) if gaps else 1.0
 
+    def _peak_strengths(self, candidate: Candidate) -> Tuple[float, float]:
+        clip_peak_score = float(candidate.metadata.get("clip_peak_score", candidate.clip_score))
+        frame_peak_score = float(candidate.metadata.get("frame_peak_score", candidate.frame_score))
+        clip_weight = float(candidate.metadata.get("clip_scale_weight", 1.0))
+        frame_weight = float(candidate.metadata.get("frame_scale_weight", 1.0))
+        return clip_peak_score * clip_weight, frame_peak_score * frame_weight
+
+    def _window_for_round(
+        self,
+        candidate: Candidate,
+        clip_t: float,
+        frame_t: float,
+        round_idx: int,
+        duration: Optional[float],
+    ) -> TimeWindow:
+        initial = self.cfg.budget.initial_window_seconds
+        clip_strength, frame_strength = self._peak_strengths(candidate)
+        primary, secondary = (clip_t, frame_t) if clip_strength >= frame_strength else (frame_t, clip_t)
+        dual_seed = abs(clip_t - frame_t) > initial / 2.0
+
+        if round_idx == 0:
+            seed = primary
+            width = initial
+        elif round_idx == 1 and dual_seed:
+            seed = secondary
+            width = initial
+        else:
+            expansion_idx = round_idx if not dual_seed else round_idx - 1
+            seed = 0.5 * (clip_t + frame_t) if dual_seed else primary
+            width = initial * (self.cfg.budget.expansion_factor ** expansion_idx)
+
+        window = TimeWindow(max(0.0, seed - width / 2.0), seed + width / 2.0)
+        return window.clamp(duration) if duration is not None else window
+
     def rerank(self, query: str, candidates: list[Candidate]) -> list[RerankedCandidate]:
         if not candidates:
             return []
         graph = self.planner.plan(query)
+        expected_event_ids = {event.id for event in graph.atomic_events}
+        expected_temporal_ids = {rel.id for rel in graph.temporal_constraints}
+        expected_identity_ids = {rel.id for rel in graph.identity_constraints}
+
         sorted_base = sorted(candidates, key=lambda c: c.base_score, reverse=True)
         verify_set = sorted_base[: self.cfg.top_k_verify]
-        output: list[RerankedCandidate] = []
+        output = []
 
         for idx, candidate in enumerate(verify_set):
-            clip_t, frame_t = self._peak_times(candidate)
+            video_path = str(self.video_path_resolver(candidate.video_id))
+            clip_t, frame_t, duration = self._peak_times(candidate, video_path)
             state = CandidateEvidenceState(
                 candidate=candidate,
                 retrieval_margin=self._local_margin(sorted_base, idx),
                 peak_gap_seconds=abs(clip_t - frame_t),
             )
-            seed = 0.5 * (clip_t + frame_t)
             last_uncertainty = 1.0
             last_verification = None
-            video_path = str(self.video_path_resolver(candidate.video_id))
 
             for round_idx in range(self.cfg.budget.max_rounds):
-                window = self._window(seed, round_idx)
+                window = self._window_for_round(candidate, clip_t, frame_t, round_idx, duration)
+                interval = (window.start, window.end)
+                if state.has_seen(interval):
+                    break
                 support = self.evidence_backend.verify(
                     query=query,
                     graph=graph,
@@ -126,15 +220,30 @@ class PRVRAgentReranker:
                     mode="refute",
                     num_frames=self.cfg.frames_per_round,
                 )
-                state.add_round((window.start, window.end), support, refute)
-                last_verification = aggregate_evidence(state.support_evidence, state.refute_evidence)
+                state.add_round(interval, support, refute)
+                last_verification = aggregate_evidence(
+                    state.support_evidence,
+                    state.refute_evidence,
+                    expected_event_ids=expected_event_ids,
+                    expected_temporal_ids=expected_temporal_ids,
+                    expected_identity_ids=expected_identity_ids,
+                )
                 decision = decide_next_action(state, last_verification, self.cfg.budget)
                 last_uncertainty = decision.uncertainty
                 if decision.action == "stop":
                     break
 
-            if last_verification is None:  # pragma: no cover
+            if last_verification is None:
+                output.append(
+                    RerankedCandidate(
+                        candidate=candidate,
+                        final_score=self.cfg.fusion.base_weight * candidate.base_score,
+                        rounds=0,
+                        uncertainty=1.0,
+                    )
+                )
                 continue
+
             final_score = fuse_candidate_score(candidate.base_score, last_verification, self.cfg.fusion)
             output.append(
                 RerankedCandidate(
@@ -149,9 +258,9 @@ class PRVRAgentReranker:
             output.append(
                 RerankedCandidate(
                     candidate=candidate,
-                    final_score=candidate.base_score,
+                    final_score=self.cfg.fusion.base_weight * candidate.base_score,
                     rounds=0,
                     uncertainty=1.0,
                 )
             )
-        return sorted(output, key=lambda x: x.final_score, reverse=True)
+        return sorted(output, key=lambda item: item.final_score, reverse=True)
