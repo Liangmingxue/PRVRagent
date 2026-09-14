@@ -4,22 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prvr-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "Peak-seeded support-refute agentic reranking for partially relevant video retrieval."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
   "numpy>=1.24",
   "pydantic>=2.6",
 ]
 
 [project.optional-dependencies]
-torch = ["torch>=2.1"]
+torch = ["torch>=2.0"]
 video = ["decord>=0.6", "Pillow>=10.0"]
 llm = ["openai>=1.40"]
 dev = ["pytest>=8.0"]
 all = [
-  "torch>=2.1",
+  "torch>=2.0",
   "decord>=0.6",
   "Pillow>=10.0",
   "openai>=1.40",
