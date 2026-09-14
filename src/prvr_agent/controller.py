@@ -12,8 +12,7 @@ class VerificationBudgetConfig:
     initial_window_seconds: float = 12.0
     expansion_factor: float = 2.0
     early_stop_uncertainty: float = 0.18
-    continue_uncertainty: float = 0.42
-    clip_frame_disagreement_scale: float = 0.25
+    peak_disagreement_seconds_scale: float = 0.10
     retrieval_margin_scale: float = 0.20
 
 
@@ -25,6 +24,7 @@ class CandidateEvidenceState:
     refute_evidence: list[EvidenceResult] = field(default_factory=list)
     round_idx: int = 0
     retrieval_margin: float = 0.0
+    peak_gap_seconds: float = 0.0
 
     def add_round(self, interval: tuple[float, float], support: EvidenceResult, refute: EvidenceResult) -> None:
         self.round_idx += 1
@@ -35,7 +35,7 @@ class CandidateEvidenceState:
 
 @dataclass(frozen=True)
 class ControlDecision:
-    action: str  # stop | expand | overview
+    action: str  # stop | expand
     uncertainty: float
     reason: str
 
@@ -45,9 +45,11 @@ def joint_uncertainty(
     score: VerificationScore,
     cfg: VerificationBudgetConfig,
 ) -> float:
-    peak_gap = abs(state.candidate.clip_peak_index - state.candidate.frame_peak_index)
-    peak_disagreement = min(1.0, peak_gap * cfg.clip_frame_disagreement_scale)
-    margin_uncertainty = max(0.0, 1.0 - min(1.0, state.retrieval_margin / max(cfg.retrieval_margin_scale, 1e-6)))
+    peak_disagreement = min(1.0, state.peak_gap_seconds * cfg.peak_disagreement_seconds_scale)
+    margin_uncertainty = max(
+        0.0,
+        1.0 - min(1.0, state.retrieval_margin / max(cfg.retrieval_margin_scale, 1e-6)),
+    )
     evidence_uncertainty = score.uncertainty
     contradiction_conflict = min(1.0, score.contradiction)
     return min(
@@ -69,6 +71,4 @@ def decide_next_action(
         return ControlDecision("stop", u, "verification budget exhausted")
     if u <= cfg.early_stop_uncertainty and score.completeness >= 0.8 and score.contradiction <= 0.2:
         return ControlDecision("stop", u, "evidence is sufficiently complete and consistent")
-    if u >= cfg.continue_uncertainty and state.round_idx + 1 >= cfg.max_rounds:
-        return ControlDecision("overview", u, "persistent uncertainty near final round")
     return ControlDecision("expand", u, "more local evidence is needed")

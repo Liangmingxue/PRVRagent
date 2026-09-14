@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from statistics import mean
 
 from .schemas import EvidenceResult
 
@@ -28,19 +29,36 @@ class ScoreFusionConfig:
 
 
 def summarize_evidence(support: EvidenceResult, refute: EvidenceResult) -> VerificationScore:
-    atomic = max(0.0, min(1.0, support.support))
-    temporal = max(0.0, min(1.0, support.temporal_consistency))
-    identity = max(0.0, min(1.0, support.entity_consistency))
-    completeness = max(0.0, min(1.0, support.action_completeness))
-    contradiction = max(refute.support, support.contradiction, refute.contradiction)
-    uncertainty = max(support.uncertainty, refute.uncertainty)
+    """Summarize one support/refute pair.
+
+    `refute.support` means the falsifier found evidence for a counterfactual, so it
+    contributes to contradiction. `refute.contradiction` means the counterfactual
+    itself was contradicted and must *not* be treated as evidence against the query.
+    """
     return VerificationScore(
-        atomic=atomic,
-        temporal=temporal,
-        identity=identity,
-        completeness=completeness,
-        contradiction=contradiction,
-        uncertainty=uncertainty,
+        atomic=max(0.0, min(1.0, support.support)),
+        temporal=max(0.0, min(1.0, support.temporal_consistency)),
+        identity=max(0.0, min(1.0, support.entity_consistency)),
+        completeness=max(0.0, min(1.0, support.action_completeness)),
+        contradiction=max(refute.support, support.contradiction),
+        uncertainty=max(support.uncertainty, refute.uncertainty),
+    )
+
+
+def aggregate_evidence(
+    supports: list[EvidenceResult],
+    refutes: list[EvidenceResult],
+) -> VerificationScore:
+    if not supports or not refutes or len(supports) != len(refutes):
+        raise ValueError("support/refute evidence must be non-empty and aligned by round")
+    per_round = [summarize_evidence(s, r) for s, r in zip(supports, refutes)]
+    return VerificationScore(
+        atomic=max(v.atomic for v in per_round),
+        temporal=max(v.temporal for v in per_round),
+        identity=max(v.identity for v in per_round),
+        completeness=max(v.completeness for v in per_round),
+        contradiction=max(v.contradiction for v in per_round),
+        uncertainty=mean(v.uncertainty for v in per_round),
     )
 
 

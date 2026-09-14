@@ -19,6 +19,7 @@ class OpenAIFrameEvidenceBackend:
     def __init__(self, client, model: str) -> None:
         self.client = client
         self.model = model
+        self._samplers: dict[str, DecordFrameSampler] = {}
 
     @staticmethod
     def _frame_to_data_url(frame) -> str:
@@ -34,7 +35,10 @@ class OpenAIFrameEvidenceBackend:
     def verify(self, *, query: str, graph: QueryHypothesisGraph, candidate: Candidate, video_path: str, window: TimeWindow, mode: str, num_frames: int = 8) -> EvidenceResult:
         if mode not in {"support", "refute"}:
             raise ValueError("mode must be 'support' or 'refute'")
-        sampler = DecordFrameSampler(video_path)
+        sampler = self._samplers.get(video_path)
+        if sampler is None:
+            sampler = DecordFrameSampler(video_path)
+            self._samplers[video_path] = sampler
         timestamps, frames = sampler.sample(window, num_frames)
         schema = EvidenceResult.model_json_schema()
         graph_json = graph.model_dump_json(indent=2)
