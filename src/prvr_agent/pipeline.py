@@ -147,6 +147,9 @@ class PRVRAgentReranker:
         frame_weight = float(candidate.metadata.get("frame_scale_weight", 1.0))
         return clip_peak_score * clip_weight, frame_peak_score * frame_weight
 
+    def _uses_dual_seed(self, clip_t: float, frame_t: float) -> bool:
+        return abs(clip_t - frame_t) > self.cfg.budget.initial_window_seconds / 2.0
+
     def _window_for_round(
         self,
         candidate: Candidate,
@@ -158,7 +161,7 @@ class PRVRAgentReranker:
         initial = self.cfg.budget.initial_window_seconds
         clip_strength, frame_strength = self._peak_strengths(candidate)
         primary, secondary = (clip_t, frame_t) if clip_strength >= frame_strength else (frame_t, clip_t)
-        dual_seed = abs(clip_t - frame_t) > initial / 2.0
+        dual_seed = self._uses_dual_seed(clip_t, frame_t)
 
         if round_idx == 0:
             seed = primary
@@ -189,10 +192,12 @@ class PRVRAgentReranker:
         for idx, candidate in enumerate(verify_set):
             video_path = str(self.video_path_resolver(candidate.video_id))
             clip_t, frame_t, duration = self._peak_times(candidate, video_path)
+            dual_seed = self._uses_dual_seed(clip_t, frame_t)
             state = CandidateEvidenceState(
                 candidate=candidate,
                 retrieval_margin=self._local_margin(sorted_base, idx),
                 peak_gap_seconds=abs(clip_t - frame_t),
+                min_rounds_before_negative_stop=2 if dual_seed else 1,
             )
             last_uncertainty = 1.0
             last_verification = None
