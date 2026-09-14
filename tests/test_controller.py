@@ -20,3 +20,21 @@ def test_controller_can_early_stop_strong_refutation():
     d = decide_next_action(state, score, VerificationBudgetConfig())
     assert d.action == "stop"
     assert "counterevidence" in d.reason
+
+
+def test_negative_stop_waits_for_required_alternative_seed():
+    state = CandidateEvidenceState(
+        candidate=_candidate(),
+        round_idx=1,
+        retrieval_margin=0.01,
+        peak_gap_seconds=20.0,
+        min_rounds_before_negative_stop=2,
+    )
+    score = VerificationScore(0.1, 0.1, 0.1, 0.1, 0.95, 0.05)
+    first = decide_next_action(state, score, VerificationBudgetConfig())
+    assert first.action == "expand"
+
+    state.round_idx = 2
+    second = decide_next_action(state, score, VerificationBudgetConfig())
+    assert second.action == "stop"
+    assert "counterevidence" in second.reason
