@@ -7,8 +7,8 @@ The intended pipeline is:
 ```text
 query
   -> counterfactual hypothesis graph
-  -> DreamPRVR top-K + clip/frame peak locations
-  -> support/refute raw-frame verification around each peak
+  -> DreamPRVR top-K + valid clip/frame peak locations
+  -> support/refute raw-frame verification around the strongest peak(s)
   -> uncertainty-gated expansion / early stop
   -> evidence-aware reranking
 ```
@@ -21,18 +21,18 @@ query
 
 ## What is implemented
 
-- `DreamPRVRAdapter`: consumes a loaded upstream DreamPRVR model and cached context tensors, preserves clip/frame peak indices, and returns top-K candidates.
-- `OpenAIHypothesisPlanner`: structured query-to-event-graph planner. A rule-based planner is included only for smoke tests.
-- `OpenAIFrameEvidenceBackend`: raw-frame support/refute verifier with calibrated structured output.
-- `PRVRAgentReranker`: peak-seeded iterative verification and score fusion.
+- `DreamPRVRAdapter`: consumes a loaded upstream DreamPRVR model and cached context tensors, preserves the upstream retrieval score, masks padded frame locations when selecting evidence peaks, and returns top-K candidates.
+- `OpenAIHypothesisPlanner`: structured query-to-event-graph planner with bounded JSON validation/repair retries. A rule-based planner is included for smoke tests and ablations.
+- `OpenAIFrameEvidenceBackend`: raw-frame support/refute verifier with bounded video-reader caching, image resizing, structured-output validation, and evidence-id sanitization.
+- `PRVRAgentReranker`: peak-seeded iterative verification, coherent multi-round evidence aggregation, uncertainty-gated early stopping, and score fusion.
 - `LLMConfig`: OpenAI-compatible local backend configuration, defaulting to the project's Qwen3-VL vLLM server.
-- Unit tests for graph validation, contradiction penalties, peak preservation, pipeline reranking, controller early stopping, and vLLM model-id resolution.
+- CI and unit tests for graph validation, padded-peak handling, relative time mapping, contradiction semantics, coherent evidence aggregation, score-scale consistency, controller stopping, and vLLM model-id resolution.
 
 The repository does **not** copy upstream DreamPRVR/VideoHV/VideoSeek/A4VL/REVISE/VideoSearch-R1 sources. See `THIRD_PARTY.md`.
 
 ## Installation
 
-Minimal development install:
+The package supports Python 3.9+ so that it can coexist with the public DreamPRVR TVR/ActivityNet environment. Minimal development install:
 
 ```bash
 python -m venv .venv
@@ -51,7 +51,7 @@ You still need the upstream DreamPRVR repository, its features/checkpoints, and 
 
 ## Local Qwen3-VL / vLLM backend
 
-The repository now defaults to an OpenAI-compatible local vLLM service rather than the public OpenAI API. The deployment currently assumed by the defaults is:
+The repository defaults to an OpenAI-compatible local vLLM service rather than the public OpenAI API. For a same-machine deployment, bind the service explicitly to loopback:
 
 ```bash
 ENV_DIR=/home/omnisky/miniconda3/envs/chart-vllm
@@ -61,6 +61,7 @@ env -u PYTHONHOME -u PYTHONPATH \
   CUDA_VISIBLE_DEVICES=1 \
   "$ENV_DIR/bin/vllm" serve \
   /home/omnisky/xlm/newtask/charttrans-workspace/model/Qwen3-VL-8B-Instruct-FP8 \
+  --host 127.0.0.1 \
   --port 8000 \
   --trust-remote-code \
   --tool-call-parser hermes \
@@ -68,7 +69,7 @@ env -u PYTHONHOME -u PYTHONPATH \
   --gpu-memory-utilization 0.9
 ```
 
-PRVR-Agent uses normal OpenAI-compatible chat-completions and does not currently require tool calling, so `--tool-call-parser hermes` is optional for this repository.
+PRVR-Agent uses ordinary OpenAI-compatible chat-completions and does not currently require tool calling, so `--tool-call-parser hermes` is optional for this repository.
 
 Configure the client explicitly on Linux:
 
@@ -77,7 +78,9 @@ export PRVR_LLM_BASE_URL=http://127.0.0.1:8000/v1
 export PRVR_LLM_API_KEY=EMPTY
 export PRVR_LLM_MODEL=/home/omnisky/xlm/newtask/charttrans-workspace/model/Qwen3-VL-8B-Instruct-FP8
 export PRVR_LLM_TIMEOUT=120
-export PRVR_LLM_TEMPERATURE=0.1
+export PRVR_LLM_TEMPERATURE=0
+export PRVR_LLM_MAX_TOKENS=2048
+export PRVR_LLM_VALIDATION_RETRIES=2
 ```
 
 Check the endpoint and exact served model id before an experiment:
@@ -94,7 +97,7 @@ Generate a hypothesis graph with the local model:
 prvr-agent plan-llm "a man washes his hands and then opens the refrigerator"
 ```
 
-For more details, see `docs/VLLM.md`.
+For a server reachable by other machines, do not rely on a vLLM API key alone; place the service behind an appropriate firewall/reverse proxy and expose only the routes you need. See `docs/VLLM.md`.
 
 ## Smoke test
 
@@ -121,17 +124,32 @@ batch = adapter.retrieve(query_feat, query_mask, top_k=20)
 candidates = batch.candidates[0]
 ```
 
-Each candidate contains both video-level scores and the argmax locations that produced the strongest clip/frame responses. These locations seed verification rather than being treated as proof of relevance.
+Each candidate contains the upstream DreamPRVR video-level scores, valid evidence peak indices, and metadata describing the resampled clip/frame location counts.
 
-## Important dataset-specific setting
+## Peak index -> raw-video time mapping
 
-`clip_peak_index` and `frame_peak_index` are feature indices, not universally seconds. `PeakMappingConfig` has no silent default: configure both temporal strides from the exact feature-extraction pipeline before constructing `PRVRAgentReranker`. For example:
+DreamPRVR does **not** use one universal seconds-per-index stride in its public preprocessing. Its clip branch averages every video into `map_size` bins, while the frame branch uniformly resamples the original feature sequence up to `max_ctx_l`. Therefore PRVR-Agent defaults to **relative bin-center mapping** using each raw video's duration:
+
+```text
+time ~= (peak_index + 0.5) / num_valid_locations * video_duration
+```
+
+For candidates produced by `DreamPRVRAdapter`, this is automatic when using the raw-frame verifier:
 
 ```python
-from prvr_agent.pipeline import PeakMappingConfig, PipelineConfig
+from prvr_agent.pipeline import PipelineConfig, PeakMappingConfig
 
 cfg = PipelineConfig(
+    peak_mapping=PeakMappingConfig(mode="relative")
+)
+```
+
+Use `mode="fixed_stride"` only when your own feature extractor truly has a known fixed temporal stride:
+
+```python
+cfg = PipelineConfig(
     peak_mapping=PeakMappingConfig(
+        mode="fixed_stride",
         clip_seconds_per_index=CLIP_STRIDE_SECONDS,
         frame_seconds_per_index=FRAME_STRIDE_SECONDS,
     )
@@ -140,11 +158,10 @@ cfg = PipelineConfig(
 
 ## Status
 
-This is an audited **MVP research scaffold**, not yet a reproduction package. Before reporting benchmark numbers, the next required steps are:
+This remains an audited **MVP research scaffold**, not yet a benchmark reproduction package. Before reporting paper numbers, the remaining required work is:
 
-- add benchmark-specific video-id -> path resolution and exact feature-index -> timestamp mappings;
-- validate DreamPRVR feature tensor shapes for TVR / ActivityNet Captions / Charades-STA;
-- fix one reproducible Qwen3-VL/vLLM configuration for all reported experiments;
+- add benchmark-specific video-id -> raw-video path resolution for TVR / ActivityNet Captions / Charades-STA;
+- run live end-to-end Qwen3-VL verification on the target Linux machine and freeze one reproducible vLLM configuration;
 - calibrate fusion weights on validation data only;
-- log per-candidate evidence traces, cost, and failure modes;
-- add official PRVR recall/SumR evaluation wrappers.
+- add persistent per-candidate evidence/cost traces and a MetaVerifier if that remains part of the final method;
+- add official PRVR R@1/R@5/R@10/R@100/SumR evaluation wrappers and full benchmark runners.
