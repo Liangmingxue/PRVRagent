@@ -94,9 +94,29 @@ class Candidate(StrictModel):
 
 class EvidenceResult(StrictModel):
     mode: Literal["support", "refute"]
-    matched: bool
-    support: float = Field(ge=0.0, le=1.0)
-    contradiction: float = Field(ge=0.0, le=1.0)
+    matched: bool = Field(
+        description=(
+            "Whether the current agent's target hypothesis matches the observed frames. "
+            "For support mode the target is the positive query hypothesis; for refute mode "
+            "the target is a counterfactual/near-miss hypothesis."
+        )
+    )
+    support: float = Field(
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Evidence FOR the current agent's target hypothesis. In refute mode, high support "
+            "means strong evidence that a counterfactual/semantic near-miss is present."
+        ),
+    )
+    contradiction: float = Field(
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Evidence AGAINST the current agent's target hypothesis. In refute mode, high "
+            "contradiction means the falsifier's counterfactual is itself contradicted."
+        ),
+    )
     start_time: Optional[float] = Field(default=None, ge=0.0)
     end_time: Optional[float] = Field(default=None, ge=0.0)
     observations: List[str] = Field(default_factory=list)
