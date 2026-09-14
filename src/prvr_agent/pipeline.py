@@ -232,6 +232,7 @@ class PRVRAgentReranker:
                     expected_event_ids=expected_event_ids,
                     expected_temporal_ids=expected_temporal_ids,
                     expected_identity_ids=expected_identity_ids,
+                    score_config=self.cfg.fusion,
                 )
                 decision = decide_next_action(state, last_verification, self.cfg.budget)
                 last_uncertainty = decision.uncertainty
