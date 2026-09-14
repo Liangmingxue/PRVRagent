@@ -4,6 +4,7 @@ import json
 import re
 from typing import Protocol
 
+from prvr_agent.llm_config import LLMConfig, create_openai_compatible_client
 from prvr_agent.schemas import AtomicEvent, CounterfactualHypothesis, QueryHypothesisGraph, TemporalConstraint
 
 
@@ -27,11 +28,19 @@ class RuleBasedHypothesisPlanner:
             relation = "after" if " after " in lowered else "before"
             temporal.append(TemporalConstraint(event_a=events[0].id, relation=relation, event_b=events[1].id))
         counterfactuals = [
-            CounterfactualHypothesis(id="CF1", type="partial_event", description="Only a subset of the requested events is visible.")
+            CounterfactualHypothesis(
+                id="CF1",
+                type="partial_event",
+                description="Only a subset of the requested events is visible.",
+            )
         ]
         if temporal:
             counterfactuals.append(
-                CounterfactualHypothesis(id="CF2", type="temporal_reversal", description="The requested events occur in the opposite temporal order.")
+                CounterfactualHypothesis(
+                    id="CF2",
+                    type="temporal_reversal",
+                    description="The requested events occur in the opposite temporal order.",
+                )
             )
         return QueryHypothesisGraph(
             query=query,
@@ -43,9 +52,17 @@ class RuleBasedHypothesisPlanner:
 
 
 class OpenAIHypothesisPlanner:
-    def __init__(self, client, model: str) -> None:
-        self.client = client
-        self.model = model
+    """Structured planner backed by an OpenAI-compatible server such as vLLM."""
+
+    def __init__(self, client=None, model: str | None = None, *, config: LLMConfig | None = None) -> None:
+        cfg = config or LLMConfig.from_env()
+        self.client = client or create_openai_compatible_client(cfg)
+        self.model = model or cfg.model
+        self.temperature = cfg.temperature
+
+    @classmethod
+    def from_env(cls) -> "OpenAIHypothesisPlanner":
+        return cls(config=LLMConfig.from_env())
 
     def plan(self, query: str) -> QueryHypothesisGraph:
         schema = QueryHypothesisGraph.model_json_schema()
@@ -59,7 +76,7 @@ class OpenAIHypothesisPlanner:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0.1,
+            temperature=self.temperature,
             response_format={"type": "json_object"},
         )
         content = response.choices[0].message.content or "{}"
