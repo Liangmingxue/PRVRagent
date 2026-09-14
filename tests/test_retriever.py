@@ -46,3 +46,13 @@ def test_retriever_peak_ignores_padded_zero_even_if_upstream_score_does_not():
     assert candidate.frame_peak_index in {0, 1}
     assert candidate.frame_peak_index != 2
     assert candidate.metadata["frame_valid_locations"] == 2
+
+
+def test_retriever_requires_frame_mask_for_safe_evidence_peaks():
+    context = {
+        "video_metas": ["v0"],
+        "video_proposal_feat": torch.tensor([[[1.0, 0.0]]]),
+        "video_feat": torch.tensor([[[1.0, 0.0]]]),
+    }
+    with pytest.raises(ValueError, match="video_mask"):
+        DreamPRVRAdapter(FakeModel(), context)
