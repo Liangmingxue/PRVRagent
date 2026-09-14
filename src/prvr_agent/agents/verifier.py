@@ -139,8 +139,8 @@ class OpenAIFrameEvidenceBackend:
             "Search for observable evidence that the positive hypothesis is fully satisfied."
             if mode == "support"
             else (
-                "Act as a falsifier: search for observable evidence supporting a counterfactual or contradiction, "
-                "such as missing events, wrong order, wrong object, or actor mismatch."
+                "Act as a falsifier: search for observable evidence supporting a counterfactual or semantic "
+                "near-miss, such as missing events, wrong order, wrong object, or actor mismatch."
             )
         )
         content = [
@@ -151,10 +151,13 @@ class OpenAIFrameEvidenceBackend:
                     f"Inspection window: {window.start:.2f}s-{window.end:.2f}s\nMode: {mode}\n"
                     f"Task: {task}\nHypothesis graph:\n{graph_json}\n\n"
                     "Evaluate only visible evidence in the supplied frames. Do not infer unseen causes or intent. "
-                    "Use only event and relation ids present in the graph. For support mode, matched means the "
-                    "positive hypothesis matches. For refute mode, matched means a counterfactual/contradiction "
-                    "matches. Return calibrated support/contradiction values and judge event completeness, entity "
-                    "consistency, and temporal consistency."
+                    "Use only event and relation ids present in the graph. The words support and contradiction "
+                    "are always relative to THIS AGENT'S target hypothesis: in support mode, high support means "
+                    "evidence for the positive query; in refute mode, high support means evidence for a negative "
+                    "counterfactual/near-miss. In refute mode, high contradiction means the proposed refutation is "
+                    "itself contradicted, not that the query is contradicted. For support mode, matched means the "
+                    "positive hypothesis matches; for refute mode, matched means a counterfactual/near-miss matches. "
+                    "Return calibrated values and judge event completeness, entity consistency, and temporal consistency."
                 ),
             }
         ]
