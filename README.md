@@ -25,7 +25,7 @@ query
 - `OpenAIHypothesisPlanner`: structured query-to-event-graph planner. A rule-based planner is included only for smoke tests.
 - `OpenAIFrameEvidenceBackend`: raw-frame support/refute verifier with calibrated structured output.
 - `PRVRAgentReranker`: peak-seeded iterative verification and score fusion.
-- Unit tests for graph validation, contradiction penalties, and controller early stopping.
+- Unit tests for graph validation, contradiction penalties, peak preservation, pipeline reranking, and controller early stopping.
 
 The repository does **not** copy upstream DreamPRVR/VideoHV/VideoSeek/A4VL/REVISE/VideoSearch-R1 sources. See `THIRD_PARTY.md`.
 
@@ -77,7 +77,18 @@ Each candidate contains both video-level scores and the argmax locations that pr
 
 ## Important dataset-specific setting
 
-`clip_peak_index` and `frame_peak_index` are feature indices, not universally seconds. Configure `PeakMappingConfig` with the actual temporal stride used by your extracted features before running raw-video verification.
+`clip_peak_index` and `frame_peak_index` are feature indices, not universally seconds. `PeakMappingConfig` has no silent default: configure both temporal strides from the exact feature-extraction pipeline before constructing `PRVRAgentReranker`. For example:
+
+```python
+from prvr_agent.pipeline import PeakMappingConfig, PipelineConfig
+
+cfg = PipelineConfig(
+    peak_mapping=PeakMappingConfig(
+        clip_seconds_per_index=CLIP_STRIDE_SECONDS,
+        frame_seconds_per_index=FRAME_STRIDE_SECONDS,
+    )
+)
+```
 
 ## Status
 
