@@ -30,10 +30,13 @@ class DreamPRVRAdapter:
     ) -> None:
         self.model = model
         self.context_info = context_info
-        required = {"video_proposal_feat", "video_feat"}
+        required = {"video_proposal_feat", "video_feat", "video_mask"}
         missing = sorted(required.difference(context_info))
         if missing:
-            raise ValueError(f"context_info is missing required keys: {missing}")
+            raise ValueError(
+                f"context_info is missing required keys: {missing}. DreamPRVR frame masking is required "
+                "to prevent padded locations from becoming raw-video evidence seeds."
+            )
         self.video_ids = list(video_ids or context_info.get("video_metas") or [])
         self.clip_scale_weight = float(clip_scale_weight)
         self.frame_scale_weight = float(frame_scale_weight)
@@ -49,6 +52,8 @@ class DreamPRVRAdapter:
         num_videos = int(context_info["video_proposal_feat"].shape[0])
         if int(context_info["video_feat"].shape[0]) != num_videos:
             raise ValueError("clip/frame context tensors contain different numbers of videos")
+        if int(context_info["video_mask"].shape[0]) != num_videos:
+            raise ValueError("video_mask contains a different number of videos than the context tensors")
         if len(self.video_ids) != num_videos:
             raise ValueError(
                 f"video_ids length {len(self.video_ids)} does not match context video count {num_videos}"
@@ -56,8 +61,6 @@ class DreamPRVRAdapter:
 
     @staticmethod
     def _normalize_mask(valid_mask, *, target_length: int, num_videos: int, device):
-        if valid_mask is None:
-            return None
         try:
             import torch
         except ImportError as exc:  # pragma: no cover
@@ -102,15 +105,16 @@ class DreamPRVRAdapter:
         location_scores = torch.einsum("qd,vld->qvl", q, ctx)
 
         upstream_scores = location_scores.max(dim=-1).values
-        mask = DreamPRVRAdapter._normalize_mask(
-            valid_mask,
-            target_length=context_features.shape[1],
-            num_videos=context_features.shape[0],
-            device=context_features.device,
-        )
-        if mask is None:
+        if valid_mask is None:
             valid_scores = location_scores
+            mask = None
         else:
+            mask = DreamPRVRAdapter._normalize_mask(
+                valid_mask,
+                target_length=context_features.shape[1],
+                num_videos=context_features.shape[0],
+                device=context_features.device,
+            )
             valid_scores = location_scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
         peak_scores, peaks = valid_scores.max(dim=-1)
         return upstream_scores, peaks, peak_scores, mask
@@ -137,7 +141,7 @@ class DreamPRVRAdapter:
                 frame_scores, frame_peaks, frame_peak_scores, frame_mask = self._scores_and_peaks(
                     query_vectors,
                     self.context_info["video_feat"],
-                    self.context_info.get("video_mask"),
+                    self.context_info["video_mask"],
                 )
                 fused = self.clip_scale_weight * clip_scores + self.frame_scale_weight * frame_scores
                 k = min(int(top_k), int(fused.shape[1]))
@@ -151,11 +155,7 @@ class DreamPRVRAdapter:
         for q_idx in range(int(fused.shape[0])):
             row = []
             for vid_idx in top_indices[q_idx].tolist():
-                frame_valid_locations = (
-                    int(frame_mask[vid_idx].sum().item())
-                    if frame_mask is not None
-                    else int(self.context_info["video_feat"].shape[1])
-                )
+                frame_valid_locations = int(frame_mask[vid_idx].sum().item())
                 row.append(
                     Candidate(
                         video_id=str(self.video_ids[vid_idx]),
