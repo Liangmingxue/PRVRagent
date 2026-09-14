@@ -45,6 +45,20 @@ def test_aggregate_does_not_frankenstein_components_across_rounds():
     assert not (score.atomic == 1.0 and score.temporal == 1.0 and score.identity == 1.0 and score.completeness == 1.0)
 
 
+def test_counterevidence_in_other_window_does_not_poison_verified_local_moment():
+    supports = [
+        _e("support", 0.1, 0.0, temporal_consistency=0.1, entity_consistency=0.1, action_completeness=0.1),
+        _e("support", 0.95, 0.0, temporal_consistency=1.0, entity_consistency=1.0, action_completeness=1.0),
+    ]
+    refutes = [
+        _e("refute", 0.95, 0.0),
+        _e("refute", 0.05, 0.0),
+    ]
+    score = aggregate_evidence(supports, refutes)
+    assert score.atomic == 0.95
+    assert score.contradiction == 0.05
+
+
 def test_event_and_relation_coverage_caps_confidence():
     support = _e(
         "support",
