@@ -132,7 +132,35 @@ class OpenAIWorldEvidenceBackend:
             {"type": "text", "text": "Return only JSON matching this schema:\n" + json.dumps(schema)}
         )
 
-        result = request_structured_json(
+        expected_world_ids = {world.id for world in worlds.worlds}
+        valid_event_ids = {event.id for event in graph.atomic_events}
+        valid_relation_ids = {
+            rel.id for rel in list(graph.temporal_constraints) + list(graph.identity_constraints)
+        }
+        valid_counterfactual_ids = {cf.id for cf in graph.counterfactuals}
+
+        def validate_evidence(result: WorldEvidenceBundle) -> WorldEvidenceBundle:
+            observed_world_ids = {item.world_id for item in result.evidence}
+            if observed_world_ids != expected_world_ids:
+                raise ValueError(
+                    f"world observer must return evidence for every imagined world; "
+                    f"missing={sorted(expected_world_ids - observed_world_ids)}, "
+                    f"extra={sorted(observed_world_ids - expected_world_ids)}"
+                )
+            if result.candidate_video_id != candidate.video_id:
+                raise ValueError("world observer changed the candidate video id")
+            unknown_events = set(result.verified_event_ids) - valid_event_ids
+            unknown_relations = set(result.verified_relation_ids) - valid_relation_ids
+            unknown_counterfactuals = set(result.supported_counterfactual_ids) - valid_counterfactual_ids
+            if unknown_events or unknown_relations or unknown_counterfactuals:
+                raise ValueError(
+                    "world observer invented graph ids: "
+                    f"events={sorted(unknown_events)}, relations={sorted(unknown_relations)}, "
+                    f"counterfactuals={sorted(unknown_counterfactuals)}"
+                )
+            return result
+
+        return request_structured_json(
             client=self.client,
             model=self.model,
             messages=[
@@ -146,30 +174,5 @@ class OpenAIWorldEvidenceBackend:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             validation_retries=self.validation_retries,
+            validator=validate_evidence,
         )
-
-        expected_world_ids = {world.id for world in worlds.worlds}
-        observed_world_ids = {item.world_id for item in result.evidence}
-        if observed_world_ids != expected_world_ids:
-            raise ValueError(
-                f"world observer must return evidence for every imagined world; "
-                f"missing={sorted(expected_world_ids - observed_world_ids)}, "
-                f"extra={sorted(observed_world_ids - expected_world_ids)}"
-            )
-
-        valid_event_ids = {event.id for event in graph.atomic_events}
-        valid_relation_ids = {
-            rel.id for rel in list(graph.temporal_constraints) + list(graph.identity_constraints)
-        }
-        valid_counterfactual_ids = {cf.id for cf in graph.counterfactuals}
-        result = result.model_copy(
-            update={
-                "candidate_video_id": candidate.video_id,
-                "verified_event_ids": [eid for eid in result.verified_event_ids if eid in valid_event_ids],
-                "verified_relation_ids": [rid for rid in result.verified_relation_ids if rid in valid_relation_ids],
-                "supported_counterfactual_ids": [
-                    cid for cid in result.supported_counterfactual_ids if cid in valid_counterfactual_ids
-                ],
-            }
-        )
-        return result
