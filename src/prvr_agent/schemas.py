@@ -95,11 +95,12 @@ class Candidate(StrictModel):
 
 
 class EventWorld(StrictModel):
-    """One plausible global event trajectory anchored by the CQHG query event."""
+    """One plausible global event trajectory anchored by the full CQHG semantics."""
 
     id: str = Field(min_length=1)
     preconditions: list[str] = Field(default_factory=list)
     query_anchor_event_ids: list[str] = Field(min_length=1)
+    query_anchor_relation_ids: list[str] = Field(default_factory=list)
     consequences: list[str] = Field(default_factory=list)
     prior: float = Field(gt=0.0, le=1.0)
     rationale: str = ""
@@ -108,6 +109,8 @@ class EventWorld(StrictModel):
     def validate_anchor_ids(self) -> "EventWorld":
         if len(self.query_anchor_event_ids) != len(set(self.query_anchor_event_ids)):
             raise ValueError("Each CQHG anchor event id must appear exactly once in an event world")
+        if len(self.query_anchor_relation_ids) != len(set(self.query_anchor_relation_ids)):
+            raise ValueError("Each CQHG anchor relation id must appear exactly once in an event world")
         return self
 
 
@@ -134,12 +137,7 @@ class WorldEvidence(StrictModel):
 
 
 class WorldEvidenceBundle(StrictModel):
-    """One coarse candidate observation serving both CQHG and APEI.
-
-    `query_support` measures evidence that the hard CQHG positive hypothesis is
-    completely satisfied. `query_contradiction` measures evidence for a CQHG
-    counterfactual/near-miss. The per-world evidence is soft prospective context.
-    """
+    """One coarse candidate observation serving both CQHG and APEI."""
 
     candidate_video_id: str = Field(min_length=1)
     query_support: float = Field(ge=0.0, le=1.0)
