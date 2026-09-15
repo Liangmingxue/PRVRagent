@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Sequence
 
 
 @dataclass(frozen=True)
 class VisualScanPoint:
-    """One cheap sidekick observation used only for temporal structure discovery."""
+    """One cheap raw-pixel sidekick observation for temporal structure discovery."""
 
     timestamp: float
     change_score: float
@@ -19,6 +20,41 @@ class VisualScanPoint:
 
 
 @dataclass(frozen=True)
+class SemanticScanPoint:
+    """Query-agnostic semantic change derived from ordered video representations."""
+
+    timestamp: float
+    change_score: float
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.timestamp) or self.timestamp < 0:
+            raise ValueError("semantic scan timestamp must be finite and non-negative")
+        if not math.isfinite(self.change_score) or self.change_score < 0:
+            raise ValueError("semantic change_score must be finite and non-negative")
+
+
+@dataclass(frozen=True)
+class SidekickScanPoint:
+    """Robustly normalized fusion of cheap visual and semantic temporal signals."""
+
+    timestamp: float
+    visual_score: float
+    semantic_score: float
+    fused_score: float
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.timestamp) or self.timestamp < 0:
+            raise ValueError("sidekick timestamp must be finite and non-negative")
+        for name, value in (
+            ("visual_score", self.visual_score),
+            ("semantic_score", self.semantic_score),
+            ("fused_score", self.fused_score),
+        ):
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be finite and in [0, 1]")
+
+
+@dataclass(frozen=True)
 class EventSegment:
     """Variable-length event proposal produced without retrieval-peak guidance."""
 
@@ -26,6 +62,8 @@ class EventSegment:
     start: float
     end: float
     visual_salience: float
+    semantic_salience: float = 0.0
+    sidekick_salience: float = 0.0
 
     def __post_init__(self) -> None:
         if self.index < 0:
@@ -34,11 +72,16 @@ class EventSegment:
             raise ValueError("segment bounds must be finite")
         if self.start < 0 or self.end <= self.start:
             raise ValueError("event segment must have a positive duration")
-        if not math.isfinite(self.visual_salience) or not 0.0 <= self.visual_salience <= 1.0:
-            raise ValueError("visual_salience must be finite and in [0, 1]")
+        for name, value in (
+            ("visual_salience", self.visual_salience),
+            ("semantic_salience", self.semantic_salience),
+            ("sidekick_salience", self.sidekick_salience),
+        ):
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be finite and in [0, 1]")
 
 
-def _quantile(values: list[float], q: float) -> float:
+def _quantile(values: Sequence[float], q: float) -> float:
     if not values:
         return 0.0
     ordered = sorted(float(value) for value in values)
@@ -53,22 +96,197 @@ def _quantile(values: list[float], q: float) -> float:
     return ordered[lower] * (1.0 - alpha) + ordered[upper] * alpha
 
 
+def _robust_normalize(values: Sequence[float], *, scale_quantile: float = 0.90) -> list[float]:
+    """Normalize a non-negative per-video signal without being dominated by one outlier."""
+
+    if not values:
+        return []
+    if not 0.0 < scale_quantile <= 1.0:
+        raise ValueError("scale_quantile must be in (0, 1]")
+    raw = [max(0.0, float(value)) for value in values]
+    if any(not math.isfinite(value) for value in raw):
+        raise ValueError("sidekick scan contains non-finite values")
+    positive = [value for value in raw if value > 0.0]
+    if not positive:
+        return [0.0 for _ in raw]
+    scale = _quantile(positive, scale_quantile)
+    if scale <= 1e-12:
+        scale = max(positive)
+    scale = max(scale, 1e-12)
+    return [max(0.0, min(1.0, value / scale)) for value in raw]
+
+
+def semantic_scores_to_scan_points(
+    change_scores: Sequence[float],
+    duration: float,
+) -> list[SemanticScanPoint]:
+    """Map uniformly ordered DreamPRVR semantic positions onto video time.
+
+    DreamPRVR's public data provider uniformly samples/averages the frame-feature
+    sequence before context encoding, so relative feature position is a defensible
+    approximate timestamp when exact extractor timestamps are unavailable.
+    """
+
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("duration must be finite and positive")
+    scores = [float(value) for value in change_scores]
+    if any(not math.isfinite(value) or value < 0 for value in scores):
+        raise ValueError("semantic change scores must be finite and non-negative")
+    if not scores:
+        return []
+    if len(scores) == 1:
+        return [SemanticScanPoint(timestamp=0.0, change_score=scores[0])]
+    denominator = float(len(scores) - 1)
+    return [
+        SemanticScanPoint(
+            timestamp=float(duration) * idx / denominator,
+            change_score=score,
+        )
+        for idx, score in enumerate(scores)
+    ]
+
+
+def _interpolate(points: Sequence[tuple[float, float]], timestamp: float) -> float:
+    if not points:
+        return 0.0
+    if timestamp <= points[0][0]:
+        return points[0][1]
+    if timestamp >= points[-1][0]:
+        return points[-1][1]
+
+    # Sidekick traces are small (hundreds of points), so a simple ordered scan is
+    # clearer and sufficiently cheap.  The fusion itself is outside the VLM path.
+    for left, right in zip(points, points[1:]):
+        if left[0] <= timestamp <= right[0]:
+            span = right[0] - left[0]
+            if span <= 1e-12:
+                return max(left[1], right[1])
+            alpha = (timestamp - left[0]) / span
+            return left[1] * (1.0 - alpha) + right[1] * alpha
+    return points[-1][1]  # pragma: no cover - ordered bounds above should catch
+
+
+def fuse_sidekick_scans(
+    duration: float,
+    visual_points: Sequence[VisualScanPoint],
+    semantic_points: Sequence[SemanticScanPoint] = (),
+    *,
+    visual_weight: float = 0.5,
+    semantic_weight: float = 0.5,
+) -> list[SidekickScanPoint]:
+    """Fuse raw-pixel and semantic change into one query-agnostic temporal scan.
+
+    Each modality is robustly normalized per video, then aligned on the union of
+    their timestamps.  Fusion uses a weighted noisy-OR: a strong signal from
+    either modality can preserve a boundary candidate, while weak independent
+    evidence accumulates smoothly.  If semantic features are unavailable the
+    result exactly falls back to normalized visual change.
+    """
+
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("duration must be finite and positive")
+    if not math.isfinite(visual_weight) or not math.isfinite(semantic_weight):
+        raise ValueError("sidekick fusion weights must be finite")
+    if visual_weight < 0 or semantic_weight < 0:
+        raise ValueError("sidekick fusion weights must be non-negative")
+    if visual_weight + semantic_weight <= 0:
+        raise ValueError("at least one sidekick fusion weight must be positive")
+
+    visual = sorted(
+        [point for point in visual_points if 0.0 <= point.timestamp <= duration],
+        key=lambda point: point.timestamp,
+    )
+    semantic = sorted(
+        [point for point in semantic_points if 0.0 <= point.timestamp <= duration],
+        key=lambda point: point.timestamp,
+    )
+    if not visual and not semantic:
+        return [
+            SidekickScanPoint(
+                timestamp=0.0,
+                visual_score=0.0,
+                semantic_score=0.0,
+                fused_score=0.0,
+            )
+        ]
+
+    visual_norm = _robust_normalize([point.change_score for point in visual])
+    semantic_norm = _robust_normalize([point.change_score for point in semantic])
+    visual_series = [(point.timestamp, score) for point, score in zip(visual, visual_norm)]
+    semantic_series = [(point.timestamp, score) for point, score in zip(semantic, semantic_norm)]
+
+    timestamps = sorted(
+        {0.0, float(duration)}
+        | {float(point.timestamp) for point in visual}
+        | {float(point.timestamp) for point in semantic}
+    )
+
+    active_visual_weight = visual_weight if visual_series else 0.0
+    active_semantic_weight = semantic_weight if semantic_series else 0.0
+    total_weight = active_visual_weight + active_semantic_weight
+    if total_weight <= 0:  # e.g. caller disabled the only available modality
+        active_visual_weight = 1.0 if visual_series else 0.0
+        active_semantic_weight = 1.0 if semantic_series else 0.0
+        total_weight = active_visual_weight + active_semantic_weight
+    visual_exp = active_visual_weight / total_weight
+    semantic_exp = active_semantic_weight / total_weight
+
+    output: list[SidekickScanPoint] = []
+    for timestamp in timestamps:
+        visual_score = _interpolate(visual_series, timestamp) if visual_series else 0.0
+        semantic_score = _interpolate(semantic_series, timestamp) if semantic_series else 0.0
+
+        # Weighted noisy-OR.  Treat a zero-weight modality as multiplicative 1 to
+        # avoid the undefined 0**0 edge case when its normalized score is 1.
+        visual_survival = (
+            (1.0 - visual_score) ** visual_exp if visual_exp > 0 else 1.0
+        )
+        semantic_survival = (
+            (1.0 - semantic_score) ** semantic_exp if semantic_exp > 0 else 1.0
+        )
+        fused = 1.0 - visual_survival * semantic_survival
+        output.append(
+            SidekickScanPoint(
+                timestamp=timestamp,
+                visual_score=max(0.0, min(1.0, visual_score)),
+                semantic_score=max(0.0, min(1.0, semantic_score)),
+                fused_score=max(0.0, min(1.0, fused)),
+            )
+        )
+    return output
+
+
+def _as_sidekick_points(
+    duration: float,
+    scan_points: Sequence[VisualScanPoint | SidekickScanPoint],
+) -> list[SidekickScanPoint]:
+    if not scan_points:
+        return fuse_sidekick_scans(duration, [])
+    if all(isinstance(point, SidekickScanPoint) for point in scan_points):
+        return sorted(
+            [point for point in scan_points if 0.0 <= point.timestamp <= duration],
+            key=lambda point: point.timestamp,
+        )
+    if all(isinstance(point, VisualScanPoint) for point in scan_points):
+        return fuse_sidekick_scans(duration, list(scan_points))
+    raise TypeError("scan_points must be uniformly VisualScanPoint or SidekickScanPoint")
+
+
 def build_event_segments(
     duration: float,
-    scan_points: list[VisualScanPoint],
+    scan_points: Sequence[VisualScanPoint | SidekickScanPoint],
     *,
     min_segment_seconds: float = 4.0,
     max_segment_seconds: float = 24.0,
     boundary_quantile: float = 0.80,
     max_segments: int = 96,
 ) -> list[EventSegment]:
-    """Convert a dense visual-change scan into variable-length event segments.
+    """Convert a dense hybrid sidekick scan into variable-length event segments.
 
-    The sidekick proposes boundaries from local visual-change maxima and inserts
-    forced boundaries when a segment would become too long. These boundaries are
-    proposals only: CQHG relevance is still decided by the multimodal observer.
-    This avoids reintroducing query-similarity/argmax peak guidance while giving
-    short events a denser, event-aware observation lattice.
+    Boundaries come from local maxima of a task-agnostic visual/semantic temporal
+    signal.  Forced splits cap the duration of quiet regions.  The sidekick only
+    proposes event structure: CQHG relevance still comes from the multimodal
+    observer, so this does not restore query-similarity or retrieval-peak logic.
     """
 
     if not math.isfinite(duration) or duration <= 0:
@@ -85,41 +303,29 @@ def build_event_segments(
         raise ValueError("max_segments must be positive")
 
     duration = float(duration)
-    points = sorted(
-        [point for point in scan_points if 0.0 <= point.timestamp <= duration],
-        key=lambda point: point.timestamp,
-    )
+    points = _as_sidekick_points(duration, scan_points)
     if not points:
-        points = [VisualScanPoint(timestamp=0.0, change_score=0.0)]
+        points = [SidekickScanPoint(0.0, 0.0, 0.0, 0.0)]
 
-    positive_scores = [point.change_score for point in points if point.change_score > 0.0]
+    positive_scores = [point.fused_score for point in points if point.fused_score > 0.0]
     boundary_threshold = _quantile(positive_scores, boundary_quantile) if positive_scores else float("inf")
-
-    # Normalize salience per video so the sidekick can contribute to refinement
-    # priority even when absolute pixel-difference magnitudes are small.
-    salience_scale = _quantile(positive_scores, 0.90) if positive_scores else 0.0
-    if salience_scale <= 1e-12:
-        salience_scale = max(positive_scores, default=1.0)
-    salience_scale = max(salience_scale, 1e-12)
 
     candidate_boundaries: list[float] = []
     for idx, point in enumerate(points):
         if point.timestamp <= 0.0 or point.timestamp >= duration:
             continue
-        left = points[idx - 1].change_score if idx > 0 else -1.0
-        right = points[idx + 1].change_score if idx + 1 < len(points) else -1.0
+        left = points[idx - 1].fused_score if idx > 0 else -1.0
+        right = points[idx + 1].fused_score if idx + 1 < len(points) else -1.0
         is_strict_local_peak = (
-            point.change_score >= left
-            and point.change_score >= right
-            and (point.change_score > left or point.change_score > right)
+            point.fused_score >= left
+            and point.fused_score >= right
+            and (point.fused_score > left or point.fused_score > right)
         )
-        if point.change_score >= boundary_threshold and is_strict_local_peak:
+        if point.fused_score >= boundary_threshold and is_strict_local_peak:
             candidate_boundaries.append(float(point.timestamp))
 
     boundaries = [0.0]
     for candidate in candidate_boundaries:
-        # Never allow a visually quiet region to grow without bound. Forced
-        # splits preserve temporal locality while still preferring event peaks.
         while candidate - boundaries[-1] > max_segment_seconds:
             forced = boundaries[-1] + max_segment_seconds
             if duration - forced < min_segment_seconds:
@@ -138,7 +344,6 @@ def build_event_segments(
         boundaries.append(forced)
     boundaries.append(duration)
 
-    # Remove numerical duplicates while preserving order.
     canonical: list[float] = []
     for value in boundaries:
         if not canonical or value - canonical[-1] > 1e-9:
@@ -154,19 +359,20 @@ def build_event_segments(
 
     segments: list[EventSegment] = []
     for index, (start, end) in enumerate(zip(canonical, canonical[1:])):
-        local_scores = [
-            point.change_score
-            for point in points
-            if start - 1e-9 <= point.timestamp <= end + 1e-9
+        local = [
+            point for point in points if start - 1e-9 <= point.timestamp <= end + 1e-9
         ]
-        raw_salience = max(local_scores, default=0.0)
-        visual_salience = max(0.0, min(1.0, raw_salience / salience_scale))
+        visual_salience = max((point.visual_score for point in local), default=0.0)
+        semantic_salience = max((point.semantic_score for point in local), default=0.0)
+        sidekick_salience = max((point.fused_score for point in local), default=0.0)
         segments.append(
             EventSegment(
                 index=index,
                 start=float(start),
                 end=float(end),
                 visual_salience=visual_salience,
+                semantic_salience=semantic_salience,
+                sidekick_salience=sidekick_salience,
             )
         )
     return segments
