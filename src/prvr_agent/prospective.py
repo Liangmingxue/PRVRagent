@@ -18,6 +18,17 @@ class ProspectiveConfig:
     uncertainty_penalty: float = 0.15
 
     def validate(self) -> None:
+        values = {
+            "base_weight": self.base_weight,
+            "graph_weight": self.graph_weight,
+            "world_weight": self.world_weight,
+            "support_scale": self.support_scale,
+            "contradiction_scale": self.contradiction_scale,
+            "uncertainty_penalty": self.uncertainty_penalty,
+        }
+        for name, value in values.items():
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
         if self.base_weight < 0 or self.graph_weight < 0 or self.world_weight < 0:
             raise ValueError("fusion weights must be non-negative")
         if self.base_weight + self.graph_weight + self.world_weight <= 0:
@@ -47,8 +58,8 @@ class ProspectiveAssessment:
 
 def _normalized_priors(worlds: EventWorldSet) -> dict[str, float]:
     total = sum(float(world.prior) for world in worlds.worlds)
-    if total <= 0:
-        raise ValueError("event-world priors must sum to a positive value")
+    if not math.isfinite(total) or total <= 0:
+        raise ValueError("event-world priors must sum to a finite positive value")
     return {world.id: float(world.prior) / total for world in worlds.worlds}
 
 
@@ -57,12 +68,26 @@ def score_cqhg_evidence(
     evidence: WorldEvidenceBundle,
     cfg: ProspectiveConfig,
 ) -> float:
-    """Score hard query satisfaction separately from soft imagined-world context."""
+    """Score complete CQHG satisfaction, including hard relation coverage.
+
+    Atomic-event presence alone is insufficient for a multi-event query. Temporal
+    and identity constraints must also be explicitly verified when they exist.
+    """
 
     valid_event_ids = {event.id for event in graph.atomic_events}
-    verified = valid_event_ids.intersection(evidence.verified_event_ids)
-    coverage = len(verified) / max(1, len(valid_event_ids))
-    positive = min(float(evidence.query_support), coverage)
+    verified_events = valid_event_ids.intersection(evidence.verified_event_ids)
+    event_coverage = len(verified_events) / len(valid_event_ids)
+
+    valid_relation_ids = {
+        rel.id for rel in list(graph.temporal_constraints) + list(graph.identity_constraints)
+    }
+    if valid_relation_ids:
+        verified_relations = valid_relation_ids.intersection(evidence.verified_relation_ids)
+        relation_coverage = len(verified_relations) / len(valid_relation_ids)
+    else:
+        relation_coverage = 1.0
+
+    positive = min(float(evidence.query_support), event_coverage, relation_coverage)
     negative = float(evidence.query_contradiction) + cfg.uncertainty_penalty * float(evidence.query_uncertainty)
     return positive - negative
 
@@ -93,14 +118,18 @@ def revise_world_beliefs(
             math.log(max(prior, 1e-12))
             + cfg.support_scale * item.support
             - cfg.contradiction_scale * item.contradiction
+            - cfg.uncertainty_penalty * item.uncertainty
         )
 
     max_logit = max(logits.values())
     unnormalized = {world_id: math.exp(logit - max_logit) for world_id, logit in logits.items()}
     normalizer = sum(unnormalized.values())
+    if not math.isfinite(normalizer) or normalizer <= 0:  # pragma: no cover - defensive
+        raise ValueError("event-world posterior normalization failed")
 
     beliefs: list[WorldBelief] = []
     world_score = 0.0
+    positive_world_gate = max(0.0, 1.0 - float(evidence.query_contradiction))
     for world in worlds.worlds:
         item = by_id[world.id]
         posterior = unnormalized[world.id] / normalizer
@@ -114,9 +143,12 @@ def revise_world_beliefs(
                 uncertainty=item.uncertainty,
             )
         )
-        world_score += posterior * (
-            item.support - item.contradiction - cfg.uncertainty_penalty * item.uncertainty
-        )
+        local_score = item.support - item.contradiction - cfg.uncertainty_penalty * item.uncertainty
+        # Soft imagined context may help when the hard query is unresolved, but it
+        # must not rescue a candidate that has explicit CQHG contradiction evidence.
+        if local_score > 0:
+            local_score *= positive_world_gate
+        world_score += posterior * local_score
 
     return ProspectiveAssessment(
         beliefs=tuple(beliefs),
@@ -127,6 +159,8 @@ def revise_world_beliefs(
 
 def fuse_prospective_score(base_score: float, assessment: ProspectiveAssessment, cfg: ProspectiveConfig) -> float:
     cfg.validate()
+    if not math.isfinite(float(base_score)):
+        raise ValueError("base_score must be finite")
     return (
         cfg.base_weight * float(base_score)
         + cfg.graph_weight * float(assessment.graph_score)
