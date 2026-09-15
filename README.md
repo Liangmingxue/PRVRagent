@@ -63,7 +63,7 @@ query-side prior world belief
   -> prospective reranking score
 ```
 
-Missing an imagined precondition or consequence in sparse frames is treated as **neutral evidence**, not a contradiction. This is important because PRVR relevance only requires that the queried local event exists; optional context must never become a hard relevance condition.
+Missing an imagined precondition or consequence in sparse frames is treated as **neutral evidence**, not a contradiction. Because global observation is sparse, simply failing to see the queried local event is also treated as neutral/uncertain rather than proof that the event is absent. This is important because PRVR relevance only requires that the queried local event exists; optional context must never become a hard relevance condition.
 
 ## What is implemented
 
