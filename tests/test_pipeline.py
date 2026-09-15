@@ -64,7 +64,7 @@ def test_pipeline_promotes_candidate_supported_by_cqhg_and_worlds():
     assert ranked[0].world_score > ranked[1].world_score
 
 
-def test_pipeline_rejects_excessive_per_request_frame_budget():
+def test_pipeline_rejects_excessive_coarse_request_frame_budget():
     try:
         PipelineConfig(frames_per_chunk=9, chunks_per_request=8).validate()
     except ValueError as exc:
@@ -82,10 +82,30 @@ def test_pipeline_rejects_refinement_that_is_not_denser_than_coarse_pass():
         raise AssertionError("expected non-dense refinement to fail")
 
 
-def test_pipeline_rejects_excessive_refinement_frame_budget():
+def test_pipeline_allows_multiple_refinements_because_each_is_isolated():
+    # Refinement requests are intentionally sent one segment at a time, so the
+    # total refinement budget is not a per-request image-budget violation.
+    PipelineConfig(refinement_frames_per_chunk=16, max_refinement_chunks=5).validate()
+
+
+def test_pipeline_rejects_invalid_event_sidekick_and_confirmation_settings():
     try:
-        PipelineConfig(refinement_frames_per_chunk=16, max_refinement_chunks=5).validate()
+        PipelineConfig(sidekick_scan_fps=0.0).validate()
     except ValueError as exc:
-        assert "must not exceed" in str(exc)
+        assert "sidekick_scan_fps" in str(exc)
     else:
-        raise AssertionError("expected excessive refinement frame budget to fail")
+        raise AssertionError("expected invalid sidekick rate to fail")
+
+    try:
+        PipelineConfig(event_min_seconds=25.0, target_chunk_seconds=20.0).validate()
+    except ValueError as exc:
+        assert "event_min_seconds" in str(exc)
+    else:
+        raise AssertionError("expected invalid event duration bounds to fail")
+
+    try:
+        PipelineConfig(confirmation_max_segments=4).validate()
+    except ValueError as exc:
+        assert "confirmation_max_segments" in str(exc)
+    else:
+        raise AssertionError("expected oversized confirmation span to fail")
