@@ -136,12 +136,23 @@ class WorldEvidence(StrictModel):
     observations: list[str] = Field(default_factory=list)
 
 
-class ChunkEvidence(StrictModel):
-    """Evidence that is valid only inside one temporal chunk.
+class EventTimeRange(StrictModel):
+    """Best visible occurrence of one CQHG atomic event in a bounded span."""
 
-    Keeping hard CQHG evidence chunk-local prevents atomic events observed far
-    apart in an untrimmed video from being silently stitched into one query match.
-    """
+    event_id: str = Field(min_length=1)
+    start_time: float = Field(ge=0.0)
+    end_time: float = Field(ge=0.0)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "EventTimeRange":
+        if self.end_time < self.start_time:
+            raise ValueError("event time range end_time must be >= start_time")
+        return self
+
+
+class ChunkEvidence(StrictModel):
+    """Evidence valid only inside one bounded temporal observation span."""
 
     chunk_index: int = Field(ge=0)
     start_time: float = Field(ge=0.0)
@@ -152,6 +163,7 @@ class ChunkEvidence(StrictModel):
     verified_event_ids: list[str] = Field(default_factory=list)
     verified_relation_ids: list[str] = Field(default_factory=list)
     supported_counterfactual_ids: list[str] = Field(default_factory=list)
+    event_time_ranges: list[EventTimeRange] = Field(default_factory=list)
     evidence: list[WorldEvidence] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -168,11 +180,14 @@ class ChunkEvidence(StrictModel):
         ):
             if len(ids) != len(set(ids)):
                 raise ValueError(f"{name} must not contain duplicate ids")
+        timed_event_ids = [item.event_id for item in self.event_time_ranges]
+        if len(timed_event_ids) != len(set(timed_event_ids)):
+            raise ValueError("event_time_ranges must contain at most one best occurrence per event id")
         return self
 
 
 class ChunkEvidenceBundle(StrictModel):
-    """Structured whole-video observation represented as independent chunks."""
+    """Structured observation represented as independent bounded spans."""
 
     candidate_video_id: str = Field(min_length=1)
     chunks: list[ChunkEvidence] = Field(min_length=1)
@@ -185,8 +200,23 @@ class ChunkEvidenceBundle(StrictModel):
         return self
 
 
+class TemporalSegmentTrace(StrictModel):
+    """Trace of a cheap sidekick event proposal used by APEI observation."""
+
+    segment_index: int = Field(ge=0)
+    start_time: float = Field(ge=0.0)
+    end_time: float = Field(ge=0.0)
+    visual_salience: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "TemporalSegmentTrace":
+        if self.end_time <= self.start_time:
+            raise ValueError("temporal segment trace must have positive duration")
+        return self
+
+
 class WorldEvidenceBundle(StrictModel):
-    """Candidate-level evidence after coherence-preserving chunk aggregation."""
+    """Candidate-level evidence after event-aware observation and confirmation."""
 
     candidate_video_id: str = Field(min_length=1)
     query_support: float = Field(ge=0.0, le=1.0)
@@ -198,6 +228,10 @@ class WorldEvidenceBundle(StrictModel):
     evidence: list[WorldEvidence] = Field(min_length=1)
     anchor_chunk_index: Optional[int] = Field(default=None, ge=0)
     refined_chunk_indices: list[int] = Field(default_factory=list)
+    confirmed_chunk_indices: list[int] = Field(default_factory=list)
+    confirmation_start_time: Optional[float] = Field(default=None, ge=0.0)
+    confirmation_end_time: Optional[float] = Field(default=None, ge=0.0)
+    segment_trace: list[TemporalSegmentTrace] = Field(default_factory=list)
     chunk_evidence: list[ChunkEvidence] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -214,10 +248,25 @@ class WorldEvidenceBundle(StrictModel):
                 raise ValueError(f"{name} must not contain duplicate ids")
         if len(self.refined_chunk_indices) != len(set(self.refined_chunk_indices)):
             raise ValueError("refined_chunk_indices must not contain duplicates")
+        if len(self.confirmed_chunk_indices) != len(set(self.confirmed_chunk_indices)):
+            raise ValueError("confirmed_chunk_indices must not contain duplicates")
+        if (self.confirmation_start_time is None) != (self.confirmation_end_time is None):
+            raise ValueError("confirmation_start_time and confirmation_end_time must be set together")
+        if (
+            self.confirmation_start_time is not None
+            and self.confirmation_end_time is not None
+            and self.confirmation_end_time < self.confirmation_start_time
+        ):
+            raise ValueError("confirmation_end_time must be >= confirmation_start_time")
+        segment_ids = [segment.segment_index for segment in self.segment_trace]
+        if len(segment_ids) != len(set(segment_ids)):
+            raise ValueError("segment_trace indices must be unique")
         if self.chunk_evidence:
             valid_indices = {chunk.chunk_index for chunk in self.chunk_evidence}
             if self.anchor_chunk_index is not None and self.anchor_chunk_index not in valid_indices:
-                raise ValueError("anchor_chunk_index must reference one returned chunk")
+                raise ValueError("anchor_chunk_index must reference one returned segment")
             if not set(self.refined_chunk_indices).issubset(valid_indices):
-                raise ValueError("refined_chunk_indices must reference returned chunks")
+                raise ValueError("refined_chunk_indices must reference returned segments")
+            if not set(self.confirmed_chunk_indices).issubset(valid_indices):
+                raise ValueError("confirmed_chunk_indices must reference returned segments")
         return self
