@@ -19,7 +19,7 @@ env -u PYTHONHOME -u PYTHONPATH \
   --gpu-memory-utilization 0.9
 ```
 
-PRVR-Agent does not require tool calling for the current planner/verifier path, so `--tool-call-parser hermes` is harmless but not required by this repository.
+PRVR-Agent does not require tool calling for the current CQHG planner, prospective world planner, or world-observer path, so `--tool-call-parser hermes` is optional.
 
 Configure the client:
 
@@ -33,6 +33,18 @@ Then test connectivity:
 
 ```bash
 prvr-agent check-llm
+```
+
+Generate a CQHG:
+
+```bash
+prvr-agent plan-llm "a man washes his hands and then opens the refrigerator"
+```
+
+Generate three CQHG-anchored prospective event worlds:
+
+```bash
+prvr-agent imagine-llm "a man washes his hands and then opens the refrigerator" --num-worlds 3
 ```
 
 The model id returned by `/v1/models` must match `PRVR_LLM_MODEL`. If vLLM reports a different id, use that exact id in `PRVR_LLM_MODEL` or start vLLM with `--served-model-name <name>` and use the same name in PRVR-Agent.
