@@ -6,10 +6,13 @@ from .prospective import (
     WorldBelief,
     fuse_prospective_score,
     revise_world_beliefs,
+    score_chunk_cqhg_evidence,
 )
 from .schemas import (
     AtomicEvent,
     Candidate,
+    ChunkEvidence,
+    ChunkEvidenceBundle,
     CounterfactualHypothesis,
     EventWorld,
     EventWorldSet,
@@ -23,6 +26,8 @@ from .schemas import (
 __all__ = [
     "AtomicEvent",
     "Candidate",
+    "ChunkEvidence",
+    "ChunkEvidenceBundle",
     "CounterfactualHypothesis",
     "EventWorld",
     "EventWorldSet",
@@ -36,4 +41,5 @@ __all__ = [
     "WorldBelief",
     "fuse_prospective_score",
     "revise_world_beliefs",
+    "score_chunk_cqhg_evidence",
 ]
