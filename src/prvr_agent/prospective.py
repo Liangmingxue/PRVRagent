@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from .schemas import EventWorldSet, QueryHypothesisGraph, WorldEvidenceBundle
+from .schemas import ChunkEvidence, EventWorldSet, QueryHypothesisGraph, WorldEvidenceBundle
 
 
 @dataclass(frozen=True)
@@ -77,35 +77,69 @@ def _validate_world_anchors(graph: QueryHypothesisGraph, worlds: EventWorldSet) 
             raise ValueError(f"world {world.id!r} does not preserve the complete CQHG relation anchors")
 
 
-def score_cqhg_evidence(
+def _score_cqhg_parts(
     graph: QueryHypothesisGraph,
-    evidence: WorldEvidenceBundle,
-    cfg: ProspectiveConfig,
+    *,
+    query_support: float,
+    query_contradiction: float,
+    query_uncertainty: float,
+    verified_event_ids: list[str],
+    verified_relation_ids: list[str],
 ) -> float:
-    """Score complete CQHG satisfaction, including hard relation coverage.
-
-    Uncertainty reduces the strength of a judgment toward zero; it is not itself
-    negative evidence. This matters in PRVR because sparse observation of a long
-    video can simply fail to see the relevant local moment.
-    """
-
     valid_event_ids = {event.id for event in graph.atomic_events}
-    verified_events = valid_event_ids.intersection(evidence.verified_event_ids)
+    verified_events = valid_event_ids.intersection(verified_event_ids)
     event_coverage = len(verified_events) / len(valid_event_ids)
 
     valid_relation_ids = {
         rel.id for rel in list(graph.temporal_constraints) + list(graph.identity_constraints)
     }
     if valid_relation_ids:
-        verified_relations = valid_relation_ids.intersection(evidence.verified_relation_ids)
+        verified_relations = valid_relation_ids.intersection(verified_relation_ids)
         relation_coverage = len(verified_relations) / len(valid_relation_ids)
     else:
         relation_coverage = 1.0
 
-    positive = min(float(evidence.query_support), event_coverage, relation_coverage)
-    contradiction = float(evidence.query_contradiction)
-    confidence = max(0.0, 1.0 - float(evidence.query_uncertainty))
+    positive = min(float(query_support), event_coverage, relation_coverage)
+    contradiction = float(query_contradiction)
+    confidence = max(0.0, 1.0 - float(query_uncertainty))
     return confidence * (positive - contradiction)
+
+
+def score_chunk_cqhg_evidence(graph: QueryHypothesisGraph, chunk: ChunkEvidence) -> float:
+    """Score one coherent temporal chunk against the hard CQHG semantics."""
+
+    return _score_cqhg_parts(
+        graph,
+        query_support=chunk.query_support,
+        query_contradiction=chunk.query_contradiction,
+        query_uncertainty=chunk.query_uncertainty,
+        verified_event_ids=chunk.verified_event_ids,
+        verified_relation_ids=chunk.verified_relation_ids,
+    )
+
+
+def score_cqhg_evidence(
+    graph: QueryHypothesisGraph,
+    evidence: WorldEvidenceBundle,
+    cfg: ProspectiveConfig,
+) -> float:
+    """Score hard CQHG evidence without cross-chunk event stitching.
+
+    The observer aggregates candidate-level hard evidence from exactly one anchor
+    chunk. ``chunk_evidence`` is retained only for traceability and diagnostics;
+    it is never unioned here. Uncertainty shrinks a judgment toward zero rather
+    than acting as negative evidence.
+    """
+
+    del cfg  # Kept in the signature for stable public API and future calibration.
+    return _score_cqhg_parts(
+        graph,
+        query_support=evidence.query_support,
+        query_contradiction=evidence.query_contradiction,
+        query_uncertainty=evidence.query_uncertainty,
+        verified_event_ids=evidence.verified_event_ids,
+        verified_relation_ids=evidence.verified_relation_ids,
+    )
 
 
 def revise_world_beliefs(
@@ -162,7 +196,7 @@ def revise_world_beliefs(
         )
         evidence_confidence = max(0.0, 1.0 - item.uncertainty)
         local_score = evidence_confidence * (item.support - item.contradiction)
-        # Soft imagined context may help when the hard query is unresolved, but it
+        # Soft imagined context may help near the coherent query anchor, but it
         # must not rescue a candidate with explicit CQHG contradiction evidence.
         if local_score > 0:
             local_score *= positive_world_gate
