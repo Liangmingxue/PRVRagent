@@ -17,6 +17,9 @@ class FakeWorldBackend:
             )
             for world in worlds.worlds
         ]
+        relation_ids = [
+            rel.id for rel in list(graph.temporal_constraints) + list(graph.identity_constraints)
+        ]
         return WorldEvidenceBundle(
             candidate_video_id=candidate.video_id,
             query_support=0.95 if good else 0.2,
@@ -25,6 +28,7 @@ class FakeWorldBackend:
             verified_event_ids=[event.id for event in graph.atomic_events]
             if good
             else [graph.atomic_events[0].id],
+            verified_relation_ids=relation_ids if good else [],
             supported_counterfactual_ids=[]
             if good
             else [graph.counterfactuals[0].id],
