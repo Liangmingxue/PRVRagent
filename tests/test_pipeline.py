@@ -43,6 +43,8 @@ def test_pipeline_promotes_candidate_supported_by_cqhg_and_worlds():
         target_chunk_seconds=20.0,
         max_chunks=16,
         chunks_per_request=8,
+        refinement_frames_per_chunk=12,
+        max_refinement_chunks=3,
         scoring=ProspectiveConfig(base_weight=0.5, graph_weight=0.25, world_weight=0.25),
     )
     reranker = PRVRAgentReranker(
@@ -69,3 +71,21 @@ def test_pipeline_rejects_excessive_per_request_frame_budget():
         assert "must not exceed" in str(exc)
     else:
         raise AssertionError("expected excessive visual frame budget to fail")
+
+
+def test_pipeline_rejects_refinement_that_is_not_denser_than_coarse_pass():
+    try:
+        PipelineConfig(frames_per_chunk=8, refinement_frames_per_chunk=8).validate()
+    except ValueError as exc:
+        assert "must exceed" in str(exc)
+    else:
+        raise AssertionError("expected non-dense refinement to fail")
+
+
+def test_pipeline_rejects_excessive_refinement_frame_budget():
+    try:
+        PipelineConfig(refinement_frames_per_chunk=16, max_refinement_chunks=5).validate()
+    except ValueError as exc:
+        assert "must not exceed" in str(exc)
+    else:
+        raise AssertionError("expected excessive refinement frame budget to fail")
