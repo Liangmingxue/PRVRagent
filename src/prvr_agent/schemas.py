@@ -201,12 +201,14 @@ class ChunkEvidenceBundle(StrictModel):
 
 
 class TemporalSegmentTrace(StrictModel):
-    """Trace of a cheap sidekick event proposal used by APEI observation."""
+    """Trace of a query-agnostic hybrid sidekick event proposal used by APEI."""
 
     segment_index: int = Field(ge=0)
     start_time: float = Field(ge=0.0)
     end_time: float = Field(ge=0.0)
     visual_salience: float = Field(ge=0.0, le=1.0)
+    semantic_salience: float = Field(default=0.0, ge=0.0, le=1.0)
+    sidekick_salience: float = Field(default=0.0, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def validate_bounds(self) -> "TemporalSegmentTrace":
