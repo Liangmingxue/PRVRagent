@@ -11,6 +11,7 @@ from .agents.world_observer import (
     MAX_CHUNKS,
     MAX_CHUNKS_PER_REQUEST,
     MAX_FRAMES_PER_CHUNK,
+    MAX_REFINEMENT_CHUNKS,
     MAX_TOTAL_FRAMES_PER_REQUEST,
     WorldEvidenceBackend,
 )
@@ -27,6 +28,9 @@ class PipelineConfig:
     max_chunks: int = 64
     chunks_per_request: int = 8
     context_radius: int = 1
+    refinement_frames_per_chunk: int = 12
+    max_refinement_chunks: int = 3
+    refinement_threshold: float = 0.30
     scoring: ProspectiveConfig = ProspectiveConfig()
 
     def validate(self) -> None:
@@ -34,6 +38,21 @@ class PipelineConfig:
             raise ValueError(f"num_worlds must be in [1, {MAX_EVENT_WORLDS}]")
         if not 1 <= self.frames_per_chunk <= MAX_FRAMES_PER_CHUNK:
             raise ValueError(f"frames_per_chunk must be in [1, {MAX_FRAMES_PER_CHUNK}]")
+        if not 1 <= self.refinement_frames_per_chunk <= MAX_FRAMES_PER_CHUNK:
+            raise ValueError(
+                f"refinement_frames_per_chunk must be in [1, {MAX_FRAMES_PER_CHUNK}]"
+            )
+        if not 0 <= self.max_refinement_chunks <= MAX_REFINEMENT_CHUNKS:
+            raise ValueError(f"max_refinement_chunks must be in [0, {MAX_REFINEMENT_CHUNKS}]")
+        if self.max_refinement_chunks > 0 and self.refinement_frames_per_chunk <= self.frames_per_chunk:
+            raise ValueError("refinement_frames_per_chunk must exceed coarse frames_per_chunk")
+        if not math.isfinite(self.refinement_threshold) or not 0.0 <= self.refinement_threshold <= 1.0:
+            raise ValueError("refinement_threshold must be finite and in [0, 1]")
+        if self.max_refinement_chunks * self.refinement_frames_per_chunk > MAX_TOTAL_FRAMES_PER_REQUEST:
+            raise ValueError(
+                f"max_refinement_chunks * refinement_frames_per_chunk must not exceed "
+                f"{MAX_TOTAL_FRAMES_PER_REQUEST}"
+            )
         if not math.isfinite(self.target_chunk_seconds) or self.target_chunk_seconds <= 0:
             raise ValueError("target_chunk_seconds must be finite and positive")
         if not math.isfinite(self.chunk_overlap) or not 0.0 <= self.chunk_overlap < 1.0:
@@ -112,6 +131,9 @@ class PRVRAgentReranker:
                 max_chunks=self.cfg.max_chunks,
                 chunks_per_request=self.cfg.chunks_per_request,
                 context_radius=self.cfg.context_radius,
+                refinement_frames_per_chunk=self.cfg.refinement_frames_per_chunk,
+                max_refinement_chunks=self.cfg.max_refinement_chunks,
+                refinement_threshold=self.cfg.refinement_threshold,
             )
             if evidence.candidate_video_id != candidate.video_id:
                 raise ValueError(
