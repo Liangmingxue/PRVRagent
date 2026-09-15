@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prvr-agent"
-version = "0.1.0"
-description = "Peak-seeded support-refute agentic reranking for partially relevant video retrieval."
+version = "0.2.0"
+description = "Counterfactual and prospective event-world reasoning for partially relevant video retrieval."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

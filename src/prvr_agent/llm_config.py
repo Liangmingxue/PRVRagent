@@ -6,28 +6,45 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class LLMConfig:
-    """Configuration for an OpenAI-compatible chat-completions backend.
-
-    The defaults target a local vLLM server, but every field can be overridden
-    through environment variables. The repository never assumes access to the
-    public OpenAI API.
-    """
+    """Configuration for the project's local OpenAI-compatible vLLM server."""
 
     base_url: str = "http://127.0.0.1:8000/v1"
     api_key: str = "EMPTY"
     model: str = "/home/omnisky/xlm/newtask/charttrans-workspace/model/Qwen3-VL-8B-Instruct-FP8"
     timeout: float = 120.0
-    temperature: float = 0.1
+    temperature: float = 0.0
+    max_tokens: int = 2048
+    validation_retries: int = 2
+    http_max_retries: int = 2
 
     @classmethod
     def from_env(cls) -> "LLMConfig":
-        return cls(
+        cfg = cls(
             base_url=os.getenv("PRVR_LLM_BASE_URL", cls.base_url),
             api_key=os.getenv("PRVR_LLM_API_KEY", cls.api_key),
             model=os.getenv("PRVR_LLM_MODEL", cls.model),
             timeout=float(os.getenv("PRVR_LLM_TIMEOUT", str(cls.timeout))),
             temperature=float(os.getenv("PRVR_LLM_TEMPERATURE", str(cls.temperature))),
+            max_tokens=int(os.getenv("PRVR_LLM_MAX_TOKENS", str(cls.max_tokens))),
+            validation_retries=int(os.getenv("PRVR_LLM_VALIDATION_RETRIES", str(cls.validation_retries))),
+            http_max_retries=int(os.getenv("PRVR_LLM_HTTP_MAX_RETRIES", str(cls.http_max_retries))),
         )
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        if not self.base_url.strip():
+            raise ValueError("PRVR_LLM_BASE_URL must not be empty")
+        if not self.model.strip():
+            raise ValueError("PRVR_LLM_MODEL must not be empty")
+        if self.timeout <= 0:
+            raise ValueError("PRVR_LLM_TIMEOUT must be positive")
+        if self.max_tokens <= 0:
+            raise ValueError("PRVR_LLM_MAX_TOKENS must be positive")
+        if self.validation_retries < 0 or self.http_max_retries < 0:
+            raise ValueError("LLM retry counts must be non-negative")
+        if self.temperature < 0:
+            raise ValueError("PRVR_LLM_TEMPERATURE must be non-negative")
 
     def normalized_base_url(self) -> str:
         base = self.base_url.rstrip("/")
@@ -35,29 +52,22 @@ class LLMConfig:
 
 
 def create_openai_compatible_client(config: LLMConfig | None = None):
-    """Create an OpenAI SDK client pointed at the configured local server."""
-
     try:
         from openai import OpenAI
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("Install the optional 'llm' dependencies: pip install -e '.[llm]'") from exc
 
     cfg = config or LLMConfig.from_env()
+    cfg.validate()
     return OpenAI(
         base_url=cfg.normalized_base_url(),
         api_key=cfg.api_key,
         timeout=cfg.timeout,
+        max_retries=cfg.http_max_retries,
     )
 
 
 def resolve_served_model(client, requested_model: str | None = None) -> str:
-    """Resolve the model id exposed by an OpenAI-compatible `/v1/models` endpoint.
-
-    If ``requested_model`` is given it must match one of the served ids. This
-    catches a frequent vLLM configuration error where the filesystem model path
-    and ``--served-model-name`` differ.
-    """
-
     response = client.models.list()
     ids = [item.id for item in response.data]
     if not ids:

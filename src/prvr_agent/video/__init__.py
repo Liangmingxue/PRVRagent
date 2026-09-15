@@ -1,3 +1,3 @@
-from .sampler import DecordFrameSampler, TimeWindow
+from .sampler import DecordFrameSampler
 
-__all__ = ["DecordFrameSampler", "TimeWindow"]
+__all__ = ["DecordFrameSampler"]

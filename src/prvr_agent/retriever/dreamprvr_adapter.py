@@ -14,10 +14,9 @@ class RetrievalBatch:
 class DreamPRVRAdapter:
     """Non-invasive adapter around a loaded DreamPRVR model and cached context features.
 
-    This class deliberately does not vendor DreamPRVR. It expects an upstream model exposing
-    ``encode_query`` and cached context tensors named ``video_proposal_feat`` and ``video_feat``.
-    It recomputes the per-location similarities so the argmax locations are preserved rather than
-    discarded by the original retrieval API.
+    It preserves DreamPRVR-style clip/frame video scores for first-stage retrieval,
+    but deliberately discards local argmax locations. The agent no longer uses
+    activation peaks as evidence seeds.
     """
 
     def __init__(
@@ -38,7 +37,7 @@ class DreamPRVRAdapter:
             raise ValueError("video_ids or context_info['video_metas'] is required")
 
     @staticmethod
-    def _scores_and_peaks(query_vectors, context_features):
+    def _max_scores(query_vectors, context_features):
         try:
             import torch
             import torch.nn.functional as F
@@ -54,7 +53,7 @@ class DreamPRVRAdapter:
         q = F.normalize(query_vectors, dim=-1)
         ctx = F.normalize(context_features, dim=-1)
         location_scores = torch.einsum("qd,vld->qvl", q, ctx)
-        return location_scores.max(dim=-1)
+        return location_scores.max(dim=-1).values
 
     def retrieve(self, query_feat, query_mask, *, top_k: int = 20) -> RetrievalBatch:
         try:
@@ -66,12 +65,8 @@ class DreamPRVRAdapter:
             raise ValueError("top_k must be positive")
         with torch.no_grad():
             query_vectors = self.model.encode_query(query_feat, query_mask)
-            clip_scores, clip_peaks = self._scores_and_peaks(
-                query_vectors, self.context_info["video_proposal_feat"]
-            )
-            frame_scores, frame_peaks = self._scores_and_peaks(
-                query_vectors, self.context_info["video_feat"]
-            )
+            clip_scores = self._max_scores(query_vectors, self.context_info["video_proposal_feat"])
+            frame_scores = self._max_scores(query_vectors, self.context_info["video_feat"])
             fused = self.clip_scale_weight * clip_scores + self.frame_scale_weight * frame_scores
             k = min(int(top_k), fused.shape[1])
             _, top_indices = fused.topk(k=k, dim=1)
@@ -87,8 +82,6 @@ class DreamPRVRAdapter:
                         base_score=float(fused[q_idx, vid_idx].item()),
                         clip_score=float(clip_scores[q_idx, vid_idx].item()),
                         frame_score=float(frame_scores[q_idx, vid_idx].item()),
-                        clip_peak_index=int(clip_peaks[q_idx, vid_idx].item()),
-                        frame_peak_index=int(frame_peaks[q_idx, vid_idx].item()),
                     )
                 )
             all_candidates.append(row)

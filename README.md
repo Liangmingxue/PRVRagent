@@ -1,38 +1,83 @@
 # PRVR-Agent
 
-Research scaffold for **Partially Relevant Video Retrieval (PRVR)** that treats a strong local retrieval activation as an **evidence proposal to verify**, not as the final relevance decision.
+Research scaffold for **Partially Relevant Video Retrieval (PRVR)** with two focused ideas:
 
-The intended pipeline is:
+1. **Counterfactual Query Hypothesis Graph (CQHG)** — semantic similarity is not enough; a retrieved video should satisfy the complete queried event rather than only a near-miss.
+2. **Abductive Prospective Event World Modeling (APEI)** — PRVR should not only learn query–video compatibility; it should also reason about how the queried event could plausibly unfold inside a longer video world.
+
+The current pipeline is:
 
 ```text
 query
-  -> counterfactual hypothesis graph
-  -> DreamPRVR top-K + clip/frame peak locations
-  -> support/refute raw-frame verification around each peak
-  -> uncertainty-gated expansion / early stop
-  -> evidence-aware reranking
+  -> Counterfactual Query Hypothesis Graph
+  -> prospective event worlds: precondition -> anchored query event -> consequence
+  -> DreamPRVR top-K candidates
+  -> sparse global candidate observation
+  -> defeasible world-belief revision
+  -> CQHG + prospective reranking
 ```
 
-## Research claims encoded by the scaffold
+The previous peak-seeded support/refute controller has been removed. PRVR-Agent no longer consumes DreamPRVR argmax locations, maps feature peaks to timestamps, expands local windows, or uses peak disagreement as an uncertainty signal.
 
-1. **Counterfactual Query Hypothesis Graph**: decompose a query into atomic events, temporal/identity constraints, a positive hypothesis, and semantic near-miss counterfactuals.
-2. **Peak-Seeded Support-Refute Verification**: reuse PRVR activation peaks as search seeds, then separately seek supporting and falsifying evidence in raw video.
-3. **Retrieval-Reasoning Joint Uncertainty Budget**: allocate more visual inspection only when retrieval margin, clip/frame peak disagreement, or verifier disagreement indicate uncertainty.
+## Innovation 1: Counterfactual Query Hypothesis Graph
+
+CQHG decomposes a query into:
+
+- atomic events;
+- temporal relations;
+- identity relations;
+- a positive hypothesis describing what must be true;
+- structured counterfactual near-misses such as partial events, temporal reversal, identity breaks, wrong objects, and wrong actions.
+
+The graph answers:
+
+> **What must be true for this query to be completely satisfied?**
+
+This keeps the first contribution focused on the gap between semantic similarity and complete event satisfaction.
+
+## Innovation 2: Abductive Prospective Event World Modeling
+
+APEI starts from the CQHG and generates several plausible **event worlds**:
+
+```text
+soft preconditions
+  -> fixed CQHG query anchor
+  -> soft consequences
+```
+
+The query anchor is immutable: imagined context may be revised, but the query semantics cannot drift. Event worlds are alternatives rather than relevance requirements.
+
+For each DreamPRVR candidate, the agent uniformly samples a small number of frames across the whole video and asks the local Qwen3-VL backend to estimate:
+
+- CQHG query satisfaction;
+- CQHG counterfactual risk;
+- support/contradiction for each optional event world.
+
+The world prior is then updated with candidate evidence:
+
+```text
+query-side prior world belief
+  -> observe candidate video
+  -> support / contradict worlds
+  -> posterior world belief
+  -> prospective reranking score
+```
+
+Missing an imagined precondition or consequence in sparse frames is treated as **neutral evidence**, not a contradiction. Because global observation is sparse, simply failing to see the queried local event is also treated as neutral/uncertain rather than proof that the event is absent. This is important because PRVR relevance only requires that the queried local event exists; optional context must never become a hard relevance condition.
 
 ## What is implemented
 
-- `DreamPRVRAdapter`: consumes a loaded upstream DreamPRVR model and cached context tensors, preserves clip/frame peak indices, and returns top-K candidates.
-- `OpenAIHypothesisPlanner`: structured query-to-event-graph planner. A rule-based planner is included only for smoke tests.
-- `OpenAIFrameEvidenceBackend`: raw-frame support/refute verifier with calibrated structured output.
-- `PRVRAgentReranker`: peak-seeded iterative verification and score fusion.
-- `LLMConfig`: OpenAI-compatible local backend configuration, defaulting to the project's Qwen3-VL vLLM server.
-- Unit tests for graph validation, contradiction penalties, peak preservation, pipeline reranking, controller early stopping, and vLLM model-id resolution.
+- `OpenAIHypothesisPlanner`: Qwen3-VL/vLLM CQHG generation.
+- `OpenAIProspectiveWorldModeler`: CQHG-anchored multi-world imagination.
+- `OpenAICoarseWorldObserver`: sparse global candidate observation with no peak seeding.
+- `revise_world_beliefs`: posterior update over prospective worlds.
+- `PRVRAgentReranker`: additive CQHG + prospective reranking on top of DreamPRVR base scores.
+- `DreamPRVRAdapter`: preserves first-stage clip/frame retrieval scores but deliberately discards local argmax indices.
+- bounded structured-JSON repair for local vLLM outputs.
 
-The repository does **not** copy upstream DreamPRVR/VideoHV/VideoSeek/A4VL/REVISE/VideoSearch-R1 sources. See `THIRD_PARTY.md`.
+The repository does **not** vendor DreamPRVR or other third-party video-agent repositories. See `THIRD_PARTY.md`.
 
 ## Installation
-
-Minimal development install:
 
 ```bash
 python -m venv .venv
@@ -41,70 +86,63 @@ pip install -e '.[dev]'
 pytest
 ```
 
-For DreamPRVR integration and raw-video verification:
+For DreamPRVR + raw video + local Qwen3-VL:
 
 ```bash
 pip install -e '.[all]'
 ```
 
-You still need the upstream DreamPRVR repository, its features/checkpoints, and the benchmark data according to its own instructions.
-
 ## Local Qwen3-VL / vLLM backend
 
-The repository now defaults to an OpenAI-compatible local vLLM service rather than the public OpenAI API. The deployment currently assumed by the defaults is:
+The defaults target:
 
-```bash
-ENV_DIR=/home/omnisky/miniconda3/envs/chart-vllm
-
-env -u PYTHONHOME -u PYTHONPATH \
-  LD_LIBRARY_PATH="$ENV_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-  CUDA_VISIBLE_DEVICES=1 \
-  "$ENV_DIR/bin/vllm" serve \
-  /home/omnisky/xlm/newtask/charttrans-workspace/model/Qwen3-VL-8B-Instruct-FP8 \
-  --port 8000 \
-  --trust-remote-code \
-  --tool-call-parser hermes \
-  --max-model-len 65536 \
-  --gpu-memory-utilization 0.9
+```text
+http://127.0.0.1:8000/v1
+/home/omnisky/xlm/newtask/charttrans-workspace/model/Qwen3-VL-8B-Instruct-FP8
 ```
 
-PRVR-Agent uses normal OpenAI-compatible chat-completions and does not currently require tool calling, so `--tool-call-parser hermes` is optional for this repository.
-
-Configure the client explicitly on Linux:
+Recommended environment variables:
 
 ```bash
 export PRVR_LLM_BASE_URL=http://127.0.0.1:8000/v1
 export PRVR_LLM_API_KEY=EMPTY
 export PRVR_LLM_MODEL=/home/omnisky/xlm/newtask/charttrans-workspace/model/Qwen3-VL-8B-Instruct-FP8
 export PRVR_LLM_TIMEOUT=120
-export PRVR_LLM_TEMPERATURE=0.1
+export PRVR_LLM_TEMPERATURE=0
+export PRVR_LLM_MAX_TOKENS=2048
+export PRVR_LLM_VALIDATION_RETRIES=2
+export PRVR_LLM_HTTP_MAX_RETRIES=2
 ```
 
-Check the endpoint and exact served model id before an experiment:
+Check the server:
 
 ```bash
 prvr-agent check-llm
 ```
 
-If `/v1/models` reports a different id than the filesystem path, either set `PRVR_LLM_MODEL` to the returned id or launch vLLM with an explicit `--served-model-name` and use that same name in PRVR-Agent.
-
-Generate a hypothesis graph with the local model:
+Generate only the CQHG:
 
 ```bash
 prvr-agent plan-llm "a man washes his hands and then opens the refrigerator"
 ```
 
-For more details, see `docs/VLLM.md`.
-
-## Smoke test
+Generate the CQHG and prospective event worlds:
 
 ```bash
-prvr-agent plan "a man washes his hands and then opens the refrigerator"
+prvr-agent imagine-llm \
+  "a man puts a cake into the oven" \
+  --worlds 3
+```
+
+For a dependency-free smoke test:
+
+```bash
+prvr-agent imagine "a man puts a cake into the oven" --worlds 3
 ```
 
 ## DreamPRVR integration
 
-The adapter is non-invasive: it does not modify upstream files. After the upstream validation code has produced cached context tensors, create:
+The adapter remains non-invasive:
 
 ```python
 from prvr_agent.retriever import DreamPRVRAdapter
@@ -121,30 +159,25 @@ batch = adapter.retrieve(query_feat, query_mask, top_k=20)
 candidates = batch.candidates[0]
 ```
 
-Each candidate contains both video-level scores and the argmax locations that produced the strongest clip/frame responses. These locations seed verification rather than being treated as proof of relevance.
+`Candidate` now contains only video-level retrieval information:
 
-## Important dataset-specific setting
-
-`clip_peak_index` and `frame_peak_index` are feature indices, not universally seconds. `PeakMappingConfig` has no silent default: configure both temporal strides from the exact feature-extraction pipeline before constructing `PRVRAgentReranker`. For example:
-
-```python
-from prvr_agent.pipeline import PeakMappingConfig, PipelineConfig
-
-cfg = PipelineConfig(
-    peak_mapping=PeakMappingConfig(
-        clip_seconds_per_index=CLIP_STRIDE_SECONDS,
-        frame_seconds_per_index=FRAME_STRIDE_SECONDS,
-    )
-)
+```text
+video_id
+video_index
+base_score
+clip_score
+frame_score
+metadata
 ```
 
-## Status
+DreamPRVR's own local max pooling is still used to reproduce its first-stage video score, but PRVR-Agent no longer exposes or reasons from the argmax location.
 
-This is an audited **MVP research scaffold**, not yet a reproduction package. Before reporting benchmark numbers, the next required steps are:
+## Current research status
 
-- add benchmark-specific video-id -> path resolution and exact feature-index -> timestamp mappings;
-- validate DreamPRVR feature tensor shapes for TVR / ActivityNet Captions / Charades-STA;
-- fix one reproducible Qwen3-VL/vLLM configuration for all reported experiments;
-- calibrate fusion weights on validation data only;
-- log per-candidate evidence traces, cost, and failure modes;
-- add official PRVR recall/SumR evaluation wrappers.
+This is an MVP implementation of the new two-contribution architecture. Before reporting benchmark results, the main remaining work is:
+
+- benchmark-specific `video_id -> raw video path` resolution for TVR / ActivityNet Captions / Charades-STA;
+- live local Qwen3-VL validation of CQHG and event-world quality;
+- calibration of `num_worlds`, coarse-frame count, world-revision scales, and reranking weights on validation sets only;
+- official R@1/5/10/100 and SumR evaluation wrappers;
+- diagnostic evaluation for semantic near-misses and rare/unusual event contexts.
