@@ -1,5 +1,6 @@
 import pytest
 
+from prvr_agent.video.event_segments import VisualScanPoint, build_event_segments
 from prvr_agent.video.sampler import TimeWindow, build_overlapping_windows, uniform_bin_center_indices
 
 
@@ -52,3 +53,48 @@ def test_bin_center_sampling_avoids_wasting_sparse_samples_on_boundaries():
 
 def test_bin_center_sampling_returns_every_frame_when_budget_is_dense():
     assert uniform_bin_center_indices(5, 8, 10) == [5, 6, 7, 8]
+
+
+def test_event_segmenter_uses_visual_change_peak_as_boundary():
+    points = [VisualScanPoint(timestamp=float(t), change_score=0.02) for t in range(0, 31, 2)]
+    # A strong transition around 12 s should become an adaptive event boundary.
+    points[6] = VisualScanPoint(timestamp=12.0, change_score=0.90)
+    segments = build_event_segments(
+        30.0,
+        points,
+        min_segment_seconds=4.0,
+        max_segment_seconds=20.0,
+        boundary_quantile=0.80,
+        max_segments=8,
+    )
+    assert segments[0].start == 0.0
+    assert segments[-1].end == 30.0
+    assert any(abs(segment.end - 12.0) < 1e-6 for segment in segments)
+    assert all(segment.end - segment.start <= 20.0 + 1e-9 for segment in segments)
+
+
+def test_event_segmenter_forces_locality_even_without_visual_peaks():
+    points = [VisualScanPoint(timestamp=float(t), change_score=0.0) for t in range(0, 61, 5)]
+    segments = build_event_segments(
+        60.0,
+        points,
+        min_segment_seconds=4.0,
+        max_segment_seconds=20.0,
+        max_segments=8,
+    )
+    assert [(segment.start, segment.end) for segment in segments] == [
+        (0.0, 20.0),
+        (20.0, 40.0),
+        (40.0, 60.0),
+    ]
+
+
+def test_event_segmenter_fails_instead_of_silently_coarsening_resolution():
+    with pytest.raises(ValueError, match="requires"):
+        build_event_segments(
+            200.0,
+            [VisualScanPoint(timestamp=0.0, change_score=0.0)],
+            min_segment_seconds=4.0,
+            max_segment_seconds=20.0,
+            max_segments=4,
+        )
