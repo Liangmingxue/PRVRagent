@@ -1,32 +1,40 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-class AtomicEvent(BaseModel):
-    id: str
-    subject: str
-    action: str
-    object: str | None = None
+class StrictModel(BaseModel):
+    """Base schema that rejects silent field drift and non-finite values."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+
+class AtomicEvent(StrictModel):
+    id: str = Field(min_length=1)
+    subject: str = Field(min_length=1)
+    action: str = Field(min_length=1)
+    object: Optional[str] = None
     attributes: list[str] = Field(default_factory=list)
 
 
-class TemporalConstraint(BaseModel):
-    event_a: str
+class TemporalConstraint(StrictModel):
+    id: str = Field(min_length=1)
+    event_a: str = Field(min_length=1)
     relation: Literal["before", "after", "during", "overlap"]
-    event_b: str
+    event_b: str = Field(min_length=1)
 
 
-class IdentityConstraint(BaseModel):
-    event_a: str
-    event_b: str
+class IdentityConstraint(StrictModel):
+    id: str = Field(min_length=1)
+    event_a: str = Field(min_length=1)
+    event_b: str = Field(min_length=1)
     same_actor: bool = True
 
 
-class CounterfactualHypothesis(BaseModel):
-    id: str
+class CounterfactualHypothesis(StrictModel):
+    id: str = Field(min_length=1)
     type: Literal[
         "temporal_reversal",
         "identity_break",
@@ -35,58 +43,232 @@ class CounterfactualHypothesis(BaseModel):
         "wrong_action",
         "other",
     ]
-    description: str
+    description: str = Field(min_length=1)
 
 
-class QueryHypothesisGraph(BaseModel):
-    query: str
-    atomic_events: list[AtomicEvent]
+class QueryHypothesisGraph(StrictModel):
+    query: str = Field(min_length=1)
+    atomic_events: list[AtomicEvent] = Field(min_length=1)
     temporal_constraints: list[TemporalConstraint] = Field(default_factory=list)
     identity_constraints: list[IdentityConstraint] = Field(default_factory=list)
-    positive_hypothesis: str
+    positive_hypothesis: str = Field(min_length=1)
     counterfactuals: list[CounterfactualHypothesis] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_references(self) -> "QueryHypothesisGraph":
-        ids = {e.id for e in self.atomic_events}
+        event_ids = [event.id for event in self.atomic_events]
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("Atomic event ids must be unique")
+        valid_event_ids = set(event_ids)
+
+        relation_ids: list[str] = []
         for rel in self.temporal_constraints:
-            if rel.event_a not in ids or rel.event_b not in ids:
+            relation_ids.append(rel.id)
+            if rel.event_a not in valid_event_ids or rel.event_b not in valid_event_ids:
                 raise ValueError("Temporal constraints must reference existing atomic event ids")
+            if rel.event_a == rel.event_b:
+                raise ValueError("Temporal constraints cannot relate an event to itself")
         for rel in self.identity_constraints:
-            if rel.event_a not in ids or rel.event_b not in ids:
+            relation_ids.append(rel.id)
+            if rel.event_a not in valid_event_ids or rel.event_b not in valid_event_ids:
                 raise ValueError("Identity constraints must reference existing atomic event ids")
+            if rel.event_a == rel.event_b:
+                raise ValueError("Identity constraints cannot relate an event to itself")
+        if len(relation_ids) != len(set(relation_ids)):
+            raise ValueError("Temporal and identity constraint ids must be globally unique")
+
+        counterfactual_ids = [cf.id for cf in self.counterfactuals]
+        if len(counterfactual_ids) != len(set(counterfactual_ids)):
+            raise ValueError("Counterfactual hypothesis ids must be unique")
         return self
 
 
-class Candidate(BaseModel):
-    video_id: str
-    video_index: int
+class Candidate(StrictModel):
+    """DreamPRVR candidate without any peak-specific state."""
+
+    video_id: str = Field(min_length=1)
+    video_index: int = Field(ge=0)
     base_score: float
     clip_score: float
     frame_score: float
-    clip_peak_index: int
-    frame_peak_index: int
-    metadata: dict = Field(default_factory=dict)
+    metadata: dict[str, object] = Field(default_factory=dict)
 
 
-class EvidenceResult(BaseModel):
-    mode: Literal["support", "refute"]
-    matched: bool
-    support: float = Field(ge=0.0, le=1.0)
-    contradiction: float = Field(ge=0.0, le=1.0)
-    start_time: float | None = None
-    end_time: float | None = None
-    observations: list[str] = Field(default_factory=list)
-    verified_event_ids: list[str] = Field(default_factory=list)
-    verified_relation_ids: list[str] = Field(default_factory=list)
-    entity_consistency: float = Field(default=0.0, ge=0.0, le=1.0)
-    temporal_consistency: float = Field(default=0.0, ge=0.0, le=1.0)
-    action_completeness: float = Field(default=0.0, ge=0.0, le=1.0)
-    uncertainty: float = Field(default=0.5, ge=0.0, le=1.0)
+class EventWorld(StrictModel):
+    """One plausible global event trajectory anchored by the full CQHG semantics."""
+
+    id: str = Field(min_length=1)
+    preconditions: list[str] = Field(default_factory=list)
+    query_anchor_event_ids: list[str] = Field(min_length=1)
+    query_anchor_relation_ids: list[str] = Field(default_factory=list)
+    consequences: list[str] = Field(default_factory=list)
+    prior: float = Field(gt=0.0, le=1.0)
     rationale: str = ""
 
     @model_validator(mode="after")
-    def validate_interval(self) -> "EvidenceResult":
-        if self.start_time is not None and self.end_time is not None and self.end_time < self.start_time:
-            raise ValueError("end_time must be >= start_time")
+    def validate_anchor_ids(self) -> "EventWorld":
+        if len(self.query_anchor_event_ids) != len(set(self.query_anchor_event_ids)):
+            raise ValueError("Each CQHG anchor event id must appear exactly once in an event world")
+        if len(self.query_anchor_relation_ids) != len(set(self.query_anchor_relation_ids)):
+            raise ValueError("Each CQHG anchor relation id must appear exactly once in an event world")
+        return self
+
+
+class EventWorldSet(StrictModel):
+    query: str = Field(min_length=1)
+    worlds: list[EventWorld] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_worlds(self) -> "EventWorldSet":
+        world_ids = [world.id for world in self.worlds]
+        if len(world_ids) != len(set(world_ids)):
+            raise ValueError("Event world ids must be unique")
+        return self
+
+
+class WorldEvidence(StrictModel):
+    """Visual evidence for one imagined event world."""
+
+    world_id: str = Field(min_length=1)
+    support: float = Field(ge=0.0, le=1.0)
+    contradiction: float = Field(ge=0.0, le=1.0)
+    uncertainty: float = Field(default=0.5, ge=0.0, le=1.0)
+    observations: list[str] = Field(default_factory=list)
+
+
+class EventTimeRange(StrictModel):
+    """Best visible occurrence of one CQHG atomic event in a bounded span."""
+
+    event_id: str = Field(min_length=1)
+    start_time: float = Field(ge=0.0)
+    end_time: float = Field(ge=0.0)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "EventTimeRange":
+        if self.end_time < self.start_time:
+            raise ValueError("event time range end_time must be >= start_time")
+        return self
+
+
+class ChunkEvidence(StrictModel):
+    """Evidence valid only inside one bounded temporal observation span."""
+
+    chunk_index: int = Field(ge=0)
+    start_time: float = Field(ge=0.0)
+    end_time: float = Field(ge=0.0)
+    query_support: float = Field(ge=0.0, le=1.0)
+    query_contradiction: float = Field(ge=0.0, le=1.0)
+    query_uncertainty: float = Field(default=0.5, ge=0.0, le=1.0)
+    verified_event_ids: list[str] = Field(default_factory=list)
+    verified_relation_ids: list[str] = Field(default_factory=list)
+    supported_counterfactual_ids: list[str] = Field(default_factory=list)
+    event_time_ranges: list[EventTimeRange] = Field(default_factory=list)
+    evidence: list[WorldEvidence] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_chunk(self) -> "ChunkEvidence":
+        if self.end_time < self.start_time:
+            raise ValueError("chunk end_time must be >= start_time")
+        world_ids = [item.world_id for item in self.evidence]
+        if len(world_ids) != len(set(world_ids)):
+            raise ValueError("Each world may appear at most once in a chunk")
+        for name, ids in (
+            ("verified_event_ids", self.verified_event_ids),
+            ("verified_relation_ids", self.verified_relation_ids),
+            ("supported_counterfactual_ids", self.supported_counterfactual_ids),
+        ):
+            if len(ids) != len(set(ids)):
+                raise ValueError(f"{name} must not contain duplicate ids")
+        timed_event_ids = [item.event_id for item in self.event_time_ranges]
+        if len(timed_event_ids) != len(set(timed_event_ids)):
+            raise ValueError("event_time_ranges must contain at most one best occurrence per event id")
+        return self
+
+
+class ChunkEvidenceBundle(StrictModel):
+    """Structured observation represented as independent bounded spans."""
+
+    candidate_video_id: str = Field(min_length=1)
+    chunks: list[ChunkEvidence] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_chunks(self) -> "ChunkEvidenceBundle":
+        indices = [chunk.chunk_index for chunk in self.chunks]
+        if len(indices) != len(set(indices)):
+            raise ValueError("chunk indices must be unique")
+        return self
+
+
+class TemporalSegmentTrace(StrictModel):
+    """Trace of a query-agnostic hybrid sidekick event proposal used by APEI."""
+
+    segment_index: int = Field(ge=0)
+    start_time: float = Field(ge=0.0)
+    end_time: float = Field(ge=0.0)
+    visual_salience: float = Field(ge=0.0, le=1.0)
+    semantic_salience: float = Field(default=0.0, ge=0.0, le=1.0)
+    sidekick_salience: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "TemporalSegmentTrace":
+        if self.end_time <= self.start_time:
+            raise ValueError("temporal segment trace must have positive duration")
+        return self
+
+
+class WorldEvidenceBundle(StrictModel):
+    """Candidate-level evidence after event-aware observation and confirmation."""
+
+    candidate_video_id: str = Field(min_length=1)
+    query_support: float = Field(ge=0.0, le=1.0)
+    query_contradiction: float = Field(ge=0.0, le=1.0)
+    query_uncertainty: float = Field(default=0.5, ge=0.0, le=1.0)
+    verified_event_ids: list[str] = Field(default_factory=list)
+    verified_relation_ids: list[str] = Field(default_factory=list)
+    supported_counterfactual_ids: list[str] = Field(default_factory=list)
+    evidence: list[WorldEvidence] = Field(min_length=1)
+    anchor_chunk_index: Optional[int] = Field(default=None, ge=0)
+    refined_chunk_indices: list[int] = Field(default_factory=list)
+    confirmed_chunk_indices: list[int] = Field(default_factory=list)
+    confirmation_start_time: Optional[float] = Field(default=None, ge=0.0)
+    confirmation_end_time: Optional[float] = Field(default=None, ge=0.0)
+    segment_trace: list[TemporalSegmentTrace] = Field(default_factory=list)
+    chunk_evidence: list[ChunkEvidence] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_evidence_ids(self) -> "WorldEvidenceBundle":
+        world_ids = [item.world_id for item in self.evidence]
+        if len(world_ids) != len(set(world_ids)):
+            raise ValueError("Each world may appear at most once in an evidence bundle")
+        for name, ids in (
+            ("verified_event_ids", self.verified_event_ids),
+            ("verified_relation_ids", self.verified_relation_ids),
+            ("supported_counterfactual_ids", self.supported_counterfactual_ids),
+        ):
+            if len(ids) != len(set(ids)):
+                raise ValueError(f"{name} must not contain duplicate ids")
+        if len(self.refined_chunk_indices) != len(set(self.refined_chunk_indices)):
+            raise ValueError("refined_chunk_indices must not contain duplicates")
+        if len(self.confirmed_chunk_indices) != len(set(self.confirmed_chunk_indices)):
+            raise ValueError("confirmed_chunk_indices must not contain duplicates")
+        if (self.confirmation_start_time is None) != (self.confirmation_end_time is None):
+            raise ValueError("confirmation_start_time and confirmation_end_time must be set together")
+        if (
+            self.confirmation_start_time is not None
+            and self.confirmation_end_time is not None
+            and self.confirmation_end_time < self.confirmation_start_time
+        ):
+            raise ValueError("confirmation_end_time must be >= confirmation_start_time")
+        segment_ids = [segment.segment_index for segment in self.segment_trace]
+        if len(segment_ids) != len(set(segment_ids)):
+            raise ValueError("segment_trace indices must be unique")
+        if self.chunk_evidence:
+            valid_indices = {chunk.chunk_index for chunk in self.chunk_evidence}
+            if self.anchor_chunk_index is not None and self.anchor_chunk_index not in valid_indices:
+                raise ValueError("anchor_chunk_index must reference one returned segment")
+            if not set(self.refined_chunk_indices).issubset(valid_indices):
+                raise ValueError("refined_chunk_indices must reference returned segments")
+            if not set(self.confirmed_chunk_indices).issubset(valid_indices):
+                raise ValueError("confirmed_chunk_indices must reference returned segments")
         return self
