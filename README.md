@@ -14,9 +14,10 @@ query
   -> Counterfactual Query Hypothesis Graph
   -> K CQHG-anchored possible event worlds
   -> DreamPRVR top-K candidates
-  -> overlapping temporal chunks covering each candidate video
+  -> bounded overlapping temporal chunks covering each candidate video
        -> chunk-local hard CQHG event / relation / counterfactual evidence
        -> chunk-local soft support / contradiction for each imagined world
+       -> process long videos in several bounded chunk batches when necessary
   -> choose one coherent CQHG anchor chunk
   -> revise event-world beliefs only from the anchor neighborhood
   -> CQHG + prospective evidence-aware reranking
@@ -41,7 +42,7 @@ APEI: If it is true, how could the event world unfold?
 
 CQHG is the hard semantic anchor. For each temporal chunk, the visual observer reports `query_support`, `query_contradiction`, actually observed atomic-event ids, verified temporal/identity relation ids, and supported counterfactual ids. A multi-event query therefore cannot receive full CQHG credit from event presence alone when its required temporal or identity relation is unverified.
 
-Hard CQHG evidence is never unioned across distant chunks. For example, observing `E1` near 10 s and `E2` near 90 s does not produce a complete `E1 -> E2` query match unless one coherent chunk itself supports the required event composition and relation.
+Hard CQHG evidence is never unioned across distant chunks. For example, observing `E1` near 10 s and `E2` near 90 s does not produce a complete `E1 -> E2` query match unless one coherent bounded chunk itself supports the required event composition and relation.
 
 Prospective imagination is not allowed to modify or replace CQHG atomic events **or** its temporal/identity relations.
 
@@ -55,7 +56,7 @@ preconditions -> immutable CQHG query event -> consequences
 
 Each world contains a prior probability, every CQHG atomic-event id exactly once, and every CQHG temporal/identity relation id exactly once as hard anchors. The implementation rejects generated worlds that drop, add, duplicate, rename, or reverse these CQHG anchors.
 
-For long-video observation, `OpenAIWorldEvidenceBackend` no longer treats a uniformly sampled whole video as one evidence pool. It covers the full video with **overlapping temporal chunks** and asks the multimodal model to judge every chunk independently. The chunk width is approximately configurable (`target_chunk_seconds`, default 24 s); if a very long video would exceed the chunk budget, the width expands deterministically so the tail is never dropped. Overlap reduces boundary splits without reintroducing retrieval-peak guidance.
+For long-video observation, `OpenAIWorldEvidenceBackend` no longer treats a uniformly sampled whole video as one evidence pool. It covers the full video with **bounded overlapping temporal chunks** and asks the multimodal model to judge every chunk independently. The chunk width is approximately configurable (`target_chunk_seconds`, default 20 s), overlap reduces boundary splits, and long videos are processed in multiple chunk batches rather than silently widening a chunk. If the configured `max_chunks` is too small to preserve the requested local temporal resolution, the code fails explicitly instead of degrading locality.
 
 The hard CQHG score is taken from one coherent anchor chunk only. APEI soft context may use the anchor chunk and a small neighboring radius, allowing local preconditions/consequences to influence posterior revision without allowing distant events to be stitched into one query match. Preconditions and consequences remain soft context: their absence is not contradiction, and uncertainty only reduces evidence strength toward zero.
 
@@ -82,14 +83,14 @@ The following former components are no longer part of the intended method:
 - retrieval/verification joint uncertainty budget;
 - the old standalone peak-based support/refute reranker.
 
-DreamPRVR still uses its own internal max-similarity mechanism to produce its normal retrieval scores, but PRVR-Agent no longer exports or reasons from those argmax locations. The new temporal chunks are deterministic whole-video coverage inside APEI, not retrieval-peak proposals.
+DreamPRVR still uses its own internal max-similarity mechanism to produce its normal retrieval scores, but PRVR-Agent no longer exports or reasons from those argmax locations. The new temporal chunks are deterministic full-video coverage inside APEI, not retrieval-peak proposals.
 
 ## Main modules
 
 - `src/prvr_agent/agents/hypothesis_planner.py`: CQHG generation.
 - `src/prvr_agent/agents/world_model.py`: abductive prospective event-world generation.
-- `src/prvr_agent/agents/world_observer.py`: chunk-local CQHG/world evidence and coherence-preserving aggregation.
-- `src/prvr_agent/video/sampler.py`: overlapping full-video temporal coverage and raw-frame sampling.
+- `src/prvr_agent/agents/world_observer.py`: chunk-local CQHG/world evidence, batched long-video observation, and coherence-preserving aggregation.
+- `src/prvr_agent/video/sampler.py`: bounded overlapping full-video temporal coverage and raw-frame sampling.
 - `src/prvr_agent/prospective.py`: CQHG scoring, prior normalization, posterior belief revision, and score fusion.
 - `src/prvr_agent/pipeline.py`: end-to-end CQHG + APEI reranking.
 - `src/prvr_agent/retriever/dreamprvr_adapter.py`: non-invasive DreamPRVR top-K adapter without peak export.
@@ -170,7 +171,7 @@ batch = adapter.retrieve(query_feat, query_mask, top_k=20)
 candidates = batch.candidates[0]
 ```
 
-These candidates can then be passed to `PRVRAgentReranker`. Default long-video observation uses 4 frames per overlapping chunk, an approximately 24-second target chunk width, at most 12 chunks, and only the anchor chunk plus one neighbor on each side for soft world-context revision. The worst-case visual request is capped at 64 frames.
+These candidates can then be passed to `PRVRAgentReranker`. Default long-video observation uses 4 frames per approximately 20-second chunk, 25% overlap, at most 64 chunks, and batches 8 chunks per multimodal request. Each request is capped at 64 sampled images by configuration. Soft world-context revision uses only the coherent anchor chunk plus one temporal neighbor on each side.
 
 ## Research status
 
@@ -178,6 +179,7 @@ This branch is still an MVP research scaffold. Before benchmark reporting, the m
 
 - validate Qwen3-VL CQHG, chunk evidence, and world generation quality on real TVR / ActivityNet Captions / Charades-STA queries;
 - calibrate chunk duration/overlap/frame density on validation data and study short-event recall versus compute;
+- add an APEI-internal uncertainty-driven dense refinement pass for chunks whose coarse evidence remains ambiguous, without reintroducing retrieval-peak guidance;
 - add benchmark-specific video-id -> path resolution;
 - calibrate `base_weight`, `graph_weight`, `world_weight`, support/contradiction scales on validation data only;
 - add official PRVR R@K / SumR evaluation and ablations against whole-video coarse observation and single-caption/query-expansion baselines;
