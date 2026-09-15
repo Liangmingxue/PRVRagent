@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Callable
 
 from .agents.hypothesis_planner import HypothesisPlanner
-from .agents.world_model import EventWorldPlanner
-from .agents.world_observer import WorldEvidenceBackend
+from .agents.world_model import MAX_EVENT_WORLDS, EventWorldPlanner
+from .agents.world_observer import MAX_COARSE_FRAMES, WorldEvidenceBackend
 from .prospective import ProspectiveAssessment, ProspectiveConfig, fuse_prospective_score, revise_world_beliefs
 from .schemas import Candidate
 
@@ -18,10 +18,10 @@ class PipelineConfig:
     scoring: ProspectiveConfig = ProspectiveConfig()
 
     def validate(self) -> None:
-        if self.num_worlds <= 0:
-            raise ValueError("num_worlds must be positive")
-        if self.coarse_frames <= 0:
-            raise ValueError("coarse_frames must be positive")
+        if not 1 <= self.num_worlds <= MAX_EVENT_WORLDS:
+            raise ValueError(f"num_worlds must be in [1, {MAX_EVENT_WORLDS}]")
+        if not 1 <= self.coarse_frames <= MAX_COARSE_FRAMES:
+            raise ValueError(f"coarse_frames must be in [1, {MAX_COARSE_FRAMES}]")
         self.scoring.validate()
 
 
@@ -35,12 +35,7 @@ class RerankedCandidate:
 
 
 class PRVRAgentReranker:
-    """Two-part PRVR reasoning: CQHG satisfaction + prospective event worlds.
-
-    The former peak-seeded support/refute loop is gone. One coarse candidate
-    observation now serves both contributions: it evaluates whether the hard CQHG
-    is satisfied and revises the soft prospective worlds before score fusion.
-    """
+    """Two-part PRVR reasoning: CQHG satisfaction + prospective event worlds."""
 
     def __init__(
         self,
@@ -61,11 +56,22 @@ class PRVRAgentReranker:
     def rerank(self, query: str, candidates: list[Candidate]) -> list[RerankedCandidate]:
         if not candidates:
             return []
+        query = query.strip()
+        if not query:
+            raise ValueError("query must not be empty")
 
         graph = self.planner.plan(query)
+        if graph.query != query:
+            raise ValueError("hypothesis planner changed the retrieval query")
         worlds = self.world_planner.imagine(graph, num_worlds=self.cfg.num_worlds)
-        output: list[RerankedCandidate] = []
+        if worlds.query != graph.query:
+            raise ValueError("event worlds do not match the CQHG query")
+        if len(worlds.worlds) != self.cfg.num_worlds:
+            raise ValueError(
+                f"event-world planner returned {len(worlds.worlds)} worlds; expected {self.cfg.num_worlds}"
+            )
 
+        output: list[RerankedCandidate] = []
         for candidate in candidates:
             video_path = str(self.video_path_resolver(candidate.video_id))
             evidence = self.world_evidence_backend.assess(
@@ -76,6 +82,10 @@ class PRVRAgentReranker:
                 video_path=video_path,
                 num_frames=self.cfg.coarse_frames,
             )
+            if evidence.candidate_video_id != candidate.video_id:
+                raise ValueError(
+                    f"evidence candidate id {evidence.candidate_video_id!r} does not match {candidate.video_id!r}"
+                )
             assessment = revise_world_beliefs(graph, worlds, evidence, self.cfg.scoring)
             final_score = fuse_prospective_score(candidate.base_score, assessment, self.cfg.scoring)
             output.append(
