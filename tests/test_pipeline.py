@@ -6,26 +6,37 @@ from prvr_agent.schemas import Candidate, WorldEvidence, WorldEvidenceBundle
 
 
 class FakeWorldBackend:
-    def assess(self, *, candidate, worlds, **kwargs):
+    def assess(self, *, candidate, worlds, graph, **kwargs):
         good = candidate.video_id == "good"
-        evidence = []
-        for world in worlds.worlds:
-            evidence.append(
-                WorldEvidence(
-                    world_id=world.id,
-                    support=0.95 if good else 0.05,
-                    contradiction=0.0 if good else 0.9,
-                    uncertainty=0.05,
-                )
+        evidence = [
+            WorldEvidence(
+                world_id=world.id,
+                support=0.95 if good else 0.05,
+                contradiction=0.0 if good else 0.9,
+                uncertainty=0.05,
             )
-        return WorldEvidenceBundle(candidate_video_id=candidate.video_id, evidence=evidence)
+            for world in worlds.worlds
+        ]
+        return WorldEvidenceBundle(
+            candidate_video_id=candidate.video_id,
+            query_support=0.95 if good else 0.2,
+            query_contradiction=0.0 if good else 0.9,
+            query_uncertainty=0.05,
+            verified_event_ids=[event.id for event in graph.atomic_events]
+            if good
+            else [graph.atomic_events[0].id],
+            supported_counterfactual_ids=[]
+            if good
+            else [graph.counterfactuals[0].id],
+            evidence=evidence,
+        )
 
 
-def test_pipeline_promotes_candidate_supported_by_prospective_worlds():
+def test_pipeline_promotes_candidate_supported_by_cqhg_and_worlds():
     cfg = PipelineConfig(
         num_worlds=3,
         coarse_frames=8,
-        scoring=ProspectiveConfig(base_weight=0.5, world_weight=0.5),
+        scoring=ProspectiveConfig(base_weight=0.5, graph_weight=0.25, world_weight=0.25),
     )
     reranker = PRVRAgentReranker(
         RuleBasedHypothesisPlanner(),
@@ -40,3 +51,5 @@ def test_pipeline_promotes_candidate_supported_by_prospective_worlds():
     ]
     ranked = reranker.rerank("a person closes a door then sits", candidates)
     assert ranked[0].candidate.video_id == "good"
+    assert ranked[0].graph_score > ranked[1].graph_score
+    assert ranked[0].world_score > ranked[1].world_score
