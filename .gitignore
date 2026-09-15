@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Local environment / credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.crt
+
+# Models, datasets, and cached features
+checkpoints/
+models/
+data/
+datasets/
+features/
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.hdf5
+
+# Experiment outputs
+logs/
+outputs/
+results/
+wandb/
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
