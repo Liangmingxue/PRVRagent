@@ -9,8 +9,9 @@ from .agents.hypothesis_planner import HypothesisPlanner
 from .agents.world_model import MAX_EVENT_WORLDS, EventWorldPlanner
 from .agents.world_observer import (
     MAX_CHUNKS,
+    MAX_CHUNKS_PER_REQUEST,
     MAX_FRAMES_PER_CHUNK,
-    MAX_TOTAL_CHUNK_FRAMES,
+    MAX_TOTAL_FRAMES_PER_REQUEST,
     WorldEvidenceBackend,
 )
 from .prospective import ProspectiveAssessment, ProspectiveConfig, fuse_prospective_score, revise_world_beliefs
@@ -21,9 +22,10 @@ from .schemas import Candidate
 class PipelineConfig:
     num_worlds: int = 3
     frames_per_chunk: int = 4
-    target_chunk_seconds: float = 24.0
+    target_chunk_seconds: float = 20.0
     chunk_overlap: float = 0.25
-    max_chunks: int = 12
+    max_chunks: int = 64
+    chunks_per_request: int = 8
     context_radius: int = 1
     scoring: ProspectiveConfig = ProspectiveConfig()
 
@@ -38,12 +40,14 @@ class PipelineConfig:
             raise ValueError("chunk_overlap must be in [0, 1)")
         if not 1 <= self.max_chunks <= MAX_CHUNKS:
             raise ValueError(f"max_chunks must be in [1, {MAX_CHUNKS}]")
+        if not 1 <= self.chunks_per_request <= MAX_CHUNKS_PER_REQUEST:
+            raise ValueError(f"chunks_per_request must be in [1, {MAX_CHUNKS_PER_REQUEST}]")
+        if self.chunks_per_request * self.frames_per_chunk > MAX_TOTAL_FRAMES_PER_REQUEST:
+            raise ValueError(
+                f"chunks_per_request * frames_per_chunk must not exceed {MAX_TOTAL_FRAMES_PER_REQUEST}"
+            )
         if self.context_radius < 0:
             raise ValueError("context_radius must be non-negative")
-        if self.max_chunks * self.frames_per_chunk > MAX_TOTAL_CHUNK_FRAMES:
-            raise ValueError(
-                f"max_chunks * frames_per_chunk must not exceed {MAX_TOTAL_CHUNK_FRAMES}"
-            )
         self.scoring.validate()
 
 
@@ -106,6 +110,7 @@ class PRVRAgentReranker:
                 target_chunk_seconds=self.cfg.target_chunk_seconds,
                 chunk_overlap=self.cfg.chunk_overlap,
                 max_chunks=self.cfg.max_chunks,
+                chunks_per_request=self.cfg.chunks_per_request,
                 context_radius=self.cfg.context_radius,
             )
             if evidence.candidate_video_id != candidate.video_id:
