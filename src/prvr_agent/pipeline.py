@@ -27,15 +27,19 @@ class PipelineConfig:
 
     # Coarse VLM observation over event-aware variable-length segments.
     frames_per_chunk: int = 4
-    target_chunk_seconds: float = 20.0  # Maximum event-segment duration.
-    chunk_overlap: float = 0.25  # Compatibility-only; adaptive segments replace fixed overlap.
+    target_chunk_seconds: float = 20.0
+    chunk_overlap: float = 0.25  # API compatibility; adaptive segments replace fixed overlap.
     max_chunks: int = 64
     chunks_per_request: int = 8
     context_radius: int = 1
 
-    # Cheap dense sidekick used to propose visual event boundaries.
+    # Query-agnostic hybrid sidekick: dense raw-pixel change + cached DreamPRVR
+    # semantic feature novelty. Weights are validation-time hyperparameters rather
+    # than literature-derived constants.
     sidekick_scan_fps: float = 2.0
     sidekick_max_frames: int = 512
+    sidekick_visual_weight: float = 0.5
+    sidekick_semantic_weight: float = 0.5
     event_min_seconds: float = 4.0
     event_boundary_quantile: float = 0.80
 
@@ -57,9 +61,7 @@ class PipelineConfig:
         if not 1 <= self.frames_per_chunk <= MAX_FRAMES_PER_CHUNK:
             raise ValueError(f"frames_per_chunk must be in [1, {MAX_FRAMES_PER_CHUNK}]")
         if not 1 <= self.refinement_frames_per_chunk <= MAX_FRAMES_PER_CHUNK:
-            raise ValueError(
-                f"refinement_frames_per_chunk must be in [1, {MAX_FRAMES_PER_CHUNK}]"
-            )
+            raise ValueError(f"refinement_frames_per_chunk must be in [1, {MAX_FRAMES_PER_CHUNK}]")
         if not 0 <= self.max_refinement_chunks <= MAX_REFINEMENT_CHUNKS:
             raise ValueError(f"max_refinement_chunks must be in [0, {MAX_REFINEMENT_CHUNKS}]")
         if self.max_refinement_chunks > 0 and self.refinement_frames_per_chunk <= self.frames_per_chunk:
@@ -75,9 +77,7 @@ class PipelineConfig:
         if not 1 <= self.chunks_per_request <= MAX_CHUNKS_PER_REQUEST:
             raise ValueError(f"chunks_per_request must be in [1, {MAX_CHUNKS_PER_REQUEST}]")
         if self.chunks_per_request * self.frames_per_chunk > MAX_TOTAL_FRAMES_PER_REQUEST:
-            raise ValueError(
-                f"chunks_per_request * frames_per_chunk must not exceed {MAX_TOTAL_FRAMES_PER_REQUEST}"
-            )
+            raise ValueError(f"chunks_per_request * frames_per_chunk must not exceed {MAX_TOTAL_FRAMES_PER_REQUEST}")
         if self.context_radius < 0:
             raise ValueError("context_radius must be non-negative")
 
@@ -85,6 +85,14 @@ class PipelineConfig:
             raise ValueError("sidekick_scan_fps must be finite and positive")
         if not 2 <= self.sidekick_max_frames <= MAX_SIDEKICK_SCAN_FRAMES:
             raise ValueError(f"sidekick_max_frames must be in [2, {MAX_SIDEKICK_SCAN_FRAMES}]")
+        for name, value in (
+            ("sidekick_visual_weight", self.sidekick_visual_weight),
+            ("sidekick_semantic_weight", self.sidekick_semantic_weight),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.sidekick_visual_weight + self.sidekick_semantic_weight <= 0:
+            raise ValueError("at least one sidekick fusion weight must be positive")
         if not math.isfinite(self.event_min_seconds) or self.event_min_seconds <= 0:
             raise ValueError("event_min_seconds must be finite and positive")
         if self.event_min_seconds > self.target_chunk_seconds:
@@ -95,9 +103,7 @@ class PipelineConfig:
         if not 1 <= self.confirmation_frames <= MAX_FRAMES_PER_CHUNK:
             raise ValueError(f"confirmation_frames must be in [1, {MAX_FRAMES_PER_CHUNK}]")
         if not 1 <= self.confirmation_max_segments <= MAX_CONFIRMATION_SEGMENTS:
-            raise ValueError(
-                f"confirmation_max_segments must be in [1, {MAX_CONFIRMATION_SEGMENTS}]"
-            )
+            raise ValueError(f"confirmation_max_segments must be in [1, {MAX_CONFIRMATION_SEGMENTS}]")
         if not math.isfinite(self.confirmation_max_seconds) or self.confirmation_max_seconds <= 0:
             raise ValueError("confirmation_max_seconds must be finite and positive")
         if self.confirmation_max_seconds < self.event_min_seconds:
@@ -172,6 +178,8 @@ class PRVRAgentReranker:
                 refinement_threshold=self.cfg.refinement_threshold,
                 sidekick_scan_fps=self.cfg.sidekick_scan_fps,
                 sidekick_max_frames=self.cfg.sidekick_max_frames,
+                sidekick_visual_weight=self.cfg.sidekick_visual_weight,
+                sidekick_semantic_weight=self.cfg.sidekick_semantic_weight,
                 event_min_seconds=self.cfg.event_min_seconds,
                 event_boundary_quantile=self.cfg.event_boundary_quantile,
                 confirmation_frames=self.cfg.confirmation_frames,
