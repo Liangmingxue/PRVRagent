@@ -61,12 +61,7 @@ class QueryHypothesisGraph(BaseModel):
 
 
 class Candidate(BaseModel):
-    """DreamPRVR candidate without any peak-specific state.
-
-    The baseline retriever remains responsible for clip/frame similarity. APEI then
-    reasons over the candidate as a whole rather than treating an argmax location as
-    evidence of relevance.
-    """
+    """DreamPRVR candidate without any peak-specific state."""
 
     video_id: str
     video_index: int
@@ -110,7 +105,19 @@ class WorldEvidence(BaseModel):
 
 
 class WorldEvidenceBundle(BaseModel):
+    """One coarse candidate observation serving both CQHG and APEI.
+
+    `query_support` measures evidence that the hard CQHG positive hypothesis is
+    completely satisfied. `query_contradiction` measures evidence for a CQHG
+    counterfactual/near-miss. The per-world evidence is soft prospective context.
+    """
+
     candidate_video_id: str
+    query_support: float = Field(ge=0.0, le=1.0)
+    query_contradiction: float = Field(ge=0.0, le=1.0)
+    query_uncertainty: float = Field(default=0.5, ge=0.0, le=1.0)
+    verified_event_ids: list[str] = Field(default_factory=list)
+    supported_counterfactual_ids: list[str] = Field(default_factory=list)
     evidence: list[WorldEvidence] = Field(min_length=1)
 
     @model_validator(mode="after")
