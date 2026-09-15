@@ -108,7 +108,12 @@ def build_event_segments(
             continue
         left = points[idx - 1].change_score if idx > 0 else -1.0
         right = points[idx + 1].change_score if idx + 1 < len(points) else -1.0
-        if point.change_score >= boundary_threshold and point.change_score >= left and point.change_score >= right:
+        is_strict_local_peak = (
+            point.change_score >= left
+            and point.change_score >= right
+            and (point.change_score > left or point.change_score > right)
+        )
+        if point.change_score >= boundary_threshold and is_strict_local_peak:
             candidate_boundaries.append(float(point.timestamp))
 
     boundaries = [0.0]
