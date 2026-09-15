@@ -107,7 +107,13 @@ class OpenAIEventWorldPlanner:
             "atomic event id exactly once. Assign a positive prior to each world; the caller normalizes priors.\n\n"
             f"JSON schema:\n{json.dumps(schema, ensure_ascii=False)}"
         )
-        worlds = request_structured_json(
+
+        def validate_worlds(worlds: EventWorldSet) -> EventWorldSet:
+            if len(worlds.worlds) != num_worlds:
+                raise ValueError(f"expected exactly {num_worlds} event worlds, got {len(worlds.worlds)}")
+            return _validate_query_anchors(graph, worlds)
+
+        return request_structured_json(
             client=self.client,
             model=self.model,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -115,7 +121,5 @@ class OpenAIEventWorldPlanner:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             validation_retries=self.validation_retries,
+            validator=validate_worlds,
         )
-        if len(worlds.worlds) != num_worlds:
-            raise ValueError(f"expected exactly {num_worlds} event worlds, got {len(worlds.worlds)}")
-        return _validate_query_anchors(graph, worlds)
