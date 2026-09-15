@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Type, TypeVar
+from typing import Callable, Type, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -44,8 +44,14 @@ def request_structured_json(
     temperature: float,
     max_tokens: int,
     validation_retries: int,
+    validator: Callable[[T], T] | None = None,
 ) -> T:
-    """Request schema-valid JSON with bounded repair retries."""
+    """Request schema-valid JSON with bounded repair retries.
+
+    `validator` can enforce request-specific invariants that are not expressible in
+    the static Pydantic schema, such as preserving a particular CQHG's event ids.
+    Its ValueError is fed back to the model and retried just like schema failures.
+    """
 
     working_messages = list(messages)
     last_error: Exception | None = None
@@ -59,7 +65,8 @@ def request_structured_json(
         )
         raw = response.choices[0].message.content or "{}"
         try:
-            return parse_structured_json(raw, response_model)
+            parsed = parse_structured_json(raw, response_model)
+            return validator(parsed) if validator is not None else parsed
         except (json.JSONDecodeError, ValidationError, ValueError) as exc:
             last_error = exc
             if attempt >= validation_retries:
@@ -73,7 +80,7 @@ def request_structured_json(
                     {
                         "role": "user",
                         "content": (
-                            "The previous JSON was invalid for the required schema. "
+                            "The previous JSON was invalid for the required schema or request invariants. "
                             "Return a corrected JSON object only. Validation error:\n" + feedback
                         ),
                     },
