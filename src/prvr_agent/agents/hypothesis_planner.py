@@ -92,7 +92,13 @@ class OpenAIHypothesisPlanner:
             + "\n</query_data>\n\nJSON schema:\n"
             + json.dumps(schema, ensure_ascii=False)
         )
-        graph = request_structured_json(
+
+        def preserve_query(graph: QueryHypothesisGraph) -> QueryHypothesisGraph:
+            if graph.query != query:
+                raise ValueError("CQHG planner changed the original query text")
+            return graph
+
+        return request_structured_json(
             client=self.client,
             model=self.model,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -100,7 +106,5 @@ class OpenAIHypothesisPlanner:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             validation_retries=self.validation_retries,
+            validator=preserve_query,
         )
-        if graph.query != query:
-            raise ValueError("CQHG planner changed the original query text")
-        return graph
