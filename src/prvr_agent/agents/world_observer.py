@@ -24,12 +24,7 @@ class WorldEvidenceBackend(Protocol):
 
 
 class OpenAIWorldEvidenceBackend:
-    """Observe a candidate coarsely and revise CQHG-conditioned event-world beliefs.
-
-    Unlike the removed peak-seeded verifier, this backend samples the candidate
-    globally. It asks whether each soft imagined context is supported or visibly
-    contradicted; missing context alone is not treated as a contradiction.
-    """
+    """Coarsely observe a candidate for both CQHG satisfaction and APEI revision."""
 
     def __init__(
         self,
@@ -90,11 +85,13 @@ class OpenAIWorldEvidenceBackend:
                     f"PRVR query: {query}\nCandidate video: {candidate.video_id}\n\n"
                     f"CQHG (hard query semantics):\n{graph.model_dump_json(indent=2)}\n\n"
                     f"Prospective event worlds (soft context):\n{worlds.model_dump_json(indent=2)}\n\n"
-                    "Assess each imagined world using only visible evidence in the sampled frames. "
-                    "The CQHG query event is immutable and the preconditions/consequences are only plausible context. "
-                    "Absence of a predicted precondition or consequence is NOT contradiction. Raise contradiction only "
-                    "when visible evidence conflicts with that imagined trajectory. Return one evidence item for every "
-                    "world id and do not invent new world ids."
+                    "Perform two judgments from the same sampled evidence. First, judge CQHG satisfaction: "
+                    "query_support must be high only when the required query event is fully supported; "
+                    "query_contradiction must be high when a listed CQHG counterfactual/near-miss is supported. "
+                    "List only actually observed atomic event ids in verified_event_ids and only graph counterfactual ids "
+                    "in supported_counterfactual_ids. Second, assess every prospective world. Preconditions and consequences "
+                    "are soft context: their absence is NOT contradiction; raise world contradiction only for visible conflict. "
+                    "Return one world evidence item for every world id and do not invent ids."
                 ),
             }
         ]
@@ -108,7 +105,7 @@ class OpenAIWorldEvidenceBackend:
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a conservative prospective event-world evidence assessor for video retrieval.",
+                    "content": "You are a conservative CQHG and prospective event-world evidence assessor for video retrieval.",
                 },
                 {"role": "user", "content": content},
             ],
@@ -117,13 +114,25 @@ class OpenAIWorldEvidenceBackend:
         )
         raw = response.choices[0].message.content or "{}"
         result = WorldEvidenceBundle.model_validate_json(raw)
-        expected = {world.id for world in worlds.worlds}
-        observed = {item.world_id for item in result.evidence}
-        if observed != expected:
+
+        expected_world_ids = {world.id for world in worlds.worlds}
+        observed_world_ids = {item.world_id for item in result.evidence}
+        if observed_world_ids != expected_world_ids:
             raise ValueError(
                 f"world observer must return evidence for every imagined world; "
-                f"missing={sorted(expected - observed)}, extra={sorted(observed - expected)}"
+                f"missing={sorted(expected_world_ids - observed_world_ids)}, "
+                f"extra={sorted(observed_world_ids - expected_world_ids)}"
             )
-        if result.candidate_video_id != candidate.video_id:
-            result = result.model_copy(update={"candidate_video_id": candidate.video_id})
+
+        valid_event_ids = {event.id for event in graph.atomic_events}
+        valid_counterfactual_ids = {cf.id for cf in graph.counterfactuals}
+        result = result.model_copy(
+            update={
+                "candidate_video_id": candidate.video_id,
+                "verified_event_ids": [eid for eid in result.verified_event_ids if eid in valid_event_ids],
+                "supported_counterfactual_ids": [
+                    cid for cid in result.supported_counterfactual_ids if cid in valid_counterfactual_ids
+                ],
+            }
+        )
         return result
