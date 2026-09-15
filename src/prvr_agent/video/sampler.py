@@ -29,16 +29,17 @@ class TimeWindow:
 def build_overlapping_windows(
     duration: float,
     *,
-    target_seconds: float = 24.0,
+    target_seconds: float = 20.0,
     overlap: float = 0.25,
-    max_windows: int = 12,
+    max_windows: int = 64,
 ) -> list[TimeWindow]:
-    """Cover a video with overlapping temporal chunks without using retrieval peaks.
+    """Cover a video with bounded-width overlapping chunks, without peak guidance.
 
-    For ordinary videos we keep approximately ``target_seconds`` per chunk. If a
-    long video would require more than ``max_windows`` chunks, the chunk width is
-    expanded deterministically so the complete video is still covered. Overlap
-    reduces the chance that a multi-event query is split exactly at a boundary.
+    Chunk width is never silently enlarged to satisfy a compute cap: doing so
+    would let temporally distant events become a single "local" observation and
+    reintroduce false compositional matches. If the requested local resolution
+    needs more than ``max_windows`` chunks, the caller must explicitly increase
+    that limit or choose a coarser target width.
     """
 
     if not math.isfinite(duration) or duration <= 0:
@@ -51,39 +52,28 @@ def build_overlapping_windows(
         raise ValueError("max_windows must be positive")
 
     duration = float(duration)
-    target_seconds = min(float(target_seconds), duration)
-    if duration <= target_seconds or max_windows == 1:
+    width = min(float(target_seconds), duration)
+    if duration <= width:
         return [TimeWindow(0.0, duration)]
 
-    stride_fraction = 1.0 - float(overlap)
-    natural_stride = target_seconds * stride_fraction
-    natural_count = int(math.ceil((duration - target_seconds) / natural_stride)) + 1
-    count = min(max_windows, max(1, natural_count))
+    stride = width * (1.0 - float(overlap))
+    count = int(math.ceil((duration - width) / stride)) + 1
+    if count > max_windows:
+        raise ValueError(
+            f"video requires {count} temporal chunks to preserve target_seconds={width:.3f}; "
+            f"max_windows={max_windows}. Increase max_windows or target_seconds explicitly."
+        )
 
-    if count == 1:
-        return [TimeWindow(0.0, duration)]
+    starts = [idx * stride for idx in range(count - 1)]
+    starts.append(duration - width)
+    windows = [TimeWindow(start, min(duration, start + width)) for start in starts]
 
-    if natural_count <= max_windows:
-        width = target_seconds
-        stride = natural_stride
-    else:
-        # Solve duration = width + (count - 1) * width * (1 - overlap)
-        # so the capped number of windows still covers the whole video.
-        width = duration / (1.0 + (count - 1) * stride_fraction)
-        stride = width * stride_fraction
-
-    windows: list[TimeWindow] = []
-    for idx in range(count):
-        start = idx * stride
-        end = min(duration, start + width)
-        if idx == count - 1:
-            end = duration
-            start = max(0.0, min(start, end))
-        windows.append(TimeWindow(start, end))
-
-    # Numerical guard: the last window must reach the exact video end.
-    if windows[-1].end < duration:
-        windows[-1] = TimeWindow(windows[-1].start, duration)
+    # Numerical and construction guards: all windows must remain local, ordered,
+    # overlapping/touching, and the final window must reach the exact video end.
+    windows[-1] = TimeWindow(windows[-1].start, duration)
+    for left, right in zip(windows, windows[1:]):
+        if right.start > left.end + 1e-9:  # pragma: no cover - defensive
+            raise RuntimeError("temporal window construction introduced a coverage gap")
     return windows
 
 
