@@ -9,6 +9,7 @@ from typing import Optional, Protocol
 
 from prvr_agent.llm_config import LLMConfig, create_openai_compatible_client
 from prvr_agent.prospective import score_chunk_cqhg_evidence
+from prvr_agent.retriever.dreamprvr_adapter import SEMANTIC_SIDEKICK_METADATA_KEY
 from prvr_agent.schemas import (
     Candidate,
     ChunkEvidence,
@@ -22,7 +23,13 @@ from prvr_agent.schemas import (
     WorldEvidenceBundle,
 )
 from prvr_agent.structured_output import request_structured_json
-from prvr_agent.video.event_segments import EventSegment, build_event_segments
+from prvr_agent.video.event_segments import (
+    EventSegment,
+    SemanticScanPoint,
+    build_event_segments,
+    fuse_sidekick_scans,
+    semantic_scores_to_scan_points,
+)
 from prvr_agent.video.sampler import DecordFrameSampler, TimeWindow
 
 MAX_FRAMES_PER_CHUNK = 24
@@ -32,7 +39,6 @@ MAX_TOTAL_FRAMES_PER_REQUEST = 64
 MAX_REFINEMENT_CHUNKS = 8
 MAX_SIDEKICK_SCAN_FRAMES = 4096
 MAX_CONFIRMATION_SEGMENTS = 3
-# Backward-compatible name for callers that imported the old constant.
 MAX_COARSE_FRAMES = MAX_FRAMES_PER_CHUNK
 
 
@@ -56,6 +62,8 @@ class WorldEvidenceBackend(Protocol):
         refinement_threshold: float,
         sidekick_scan_fps: float,
         sidekick_max_frames: int,
+        sidekick_visual_weight: float,
+        sidekick_semantic_weight: float,
         event_min_seconds: float,
         event_boundary_quantile: float,
         confirmation_frames: int,
@@ -79,7 +87,7 @@ def _temporal_relation_holds(
     *,
     tolerance_seconds: float = 0.50,
 ) -> bool:
-    """Check a reported temporal relation against explicit event timestamps."""
+    """Verify a VLM-reported temporal relation against explicit timestamps."""
 
     event_a = ranges.get(relation.event_a)
     event_b = ranges.get(relation.event_b)
@@ -95,30 +103,71 @@ def _temporal_relation_holds(
             and event_a.end_time <= event_b.end_time + tolerance_seconds
         )
     if relation.relation == "overlap":
-        return max(event_a.start_time, event_b.start_time) <= min(event_a.end_time, event_b.end_time) + tolerance_seconds
-    return False  # pragma: no cover - schema constrains relation values
+        return max(event_a.start_time, event_b.start_time) <= min(
+            event_a.end_time, event_b.end_time
+        ) + tolerance_seconds
+    return False
+
+
+def _candidate_semantic_scan(candidate: Candidate, duration: float) -> list[SemanticScanPoint]:
+    """Read the query-agnostic DreamPRVR semantic trace from candidate metadata.
+
+    The trace is optional so custom retrievers remain supported.  If present it
+    must be well formed: silently accepting malformed sidekick metadata could
+    move event boundaries and corrupt the observation policy.
+    """
+
+    payload = candidate.metadata.get(SEMANTIC_SIDEKICK_METADATA_KEY)
+    if payload is None:
+        return []
+    if not isinstance(payload, dict):
+        raise ValueError("APEI semantic sidekick metadata must be a dictionary")
+    source = payload.get("source")
+    if source != "dreamprvr_encoded_frame_feat":
+        raise ValueError("unknown APEI semantic sidekick source")
+    scores = payload.get("change_scores")
+    if not isinstance(scores, (list, tuple)):
+        raise ValueError("semantic sidekick change_scores must be a list or tuple")
+    if len(scores) == 0:
+        return []
+    numeric: list[float] = []
+    for value in scores:
+        if isinstance(value, bool):
+            raise ValueError("semantic sidekick scores must be numeric, not bool")
+        try:
+            score = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("semantic sidekick scores must be numeric") from exc
+        if not math.isfinite(score) or score < 0:
+            raise ValueError("semantic sidekick scores must be finite and non-negative")
+        numeric.append(score)
+    return semantic_scores_to_scan_points(numeric, duration)
 
 
 def chunk_refinement_priority(
     graph: QueryHypothesisGraph,
     chunk: ChunkEvidence,
     *,
-    visual_salience: float = 0.0,
+    sidekick_salience: float = 0.0,
+    visual_salience: Optional[float] = None,
 ) -> float:
-    """Estimate whether a coarse event segment deserves denser observation.
+    """Estimate whether an event segment deserves denser APEI observation.
 
-    The priority deliberately combines two independent signals. Qwen contributes
-    uncertainty/partial CQHG evidence, while the cheap dense visual sidekick
-    contributes visual salience. Therefore a short event can still be revisited
-    even when the sparse VLM pass is overconfident and reports low uncertainty.
+    ``sidekick_salience`` is query-agnostic and may combine raw visual change with
+    semantic feature change.  ``visual_salience`` remains as a compatibility alias
+    for older callers/tests.  This independent signal lets APEI revisit a short
+    event even when the sparse VLM pass is confidently wrong.
     """
 
-    if not math.isfinite(visual_salience) or not 0.0 <= visual_salience <= 1.0:
-        raise ValueError("visual_salience must be finite and in [0, 1]")
+    if visual_salience is not None:
+        if sidekick_salience != 0.0:
+            raise ValueError("provide sidekick_salience or visual_salience, not both")
+        sidekick_salience = float(visual_salience)
+    if not math.isfinite(sidekick_salience) or not 0.0 <= sidekick_salience <= 1.0:
+        raise ValueError("sidekick_salience must be finite and in [0, 1]")
 
     valid_events = {event.id for event in graph.atomic_events}
     event_coverage = len(valid_events.intersection(chunk.verified_event_ids)) / len(valid_events)
-
     valid_relations = {
         rel.id for rel in list(graph.temporal_constraints) + list(graph.identity_constraints)
     }
@@ -140,7 +189,7 @@ def chunk_refinement_priority(
     uncertainty = float(chunk.query_uncertainty)
 
     priority = (
-        0.35 * visual_salience
+        0.35 * sidekick_salience
         + 0.20 * uncertainty
         + 0.20 * partial_event
         + 0.10 * unresolved_relation
@@ -154,11 +203,12 @@ def select_refinement_chunk_indices(
     graph: QueryHypothesisGraph,
     chunks: list[ChunkEvidence],
     *,
+    sidekick_salience_by_index: Optional[dict[int, float]] = None,
     visual_salience_by_index: Optional[dict[int, float]] = None,
     max_chunks: int = 3,
     threshold: float = 0.30,
 ) -> list[int]:
-    """Select ambiguous/high-change segments with explicit temporal coverage."""
+    """Select high-potential segments while retaining explicit temporal coverage."""
 
     if max_chunks < 0:
         raise ValueError("max_chunks must be non-negative")
@@ -166,23 +216,25 @@ def select_refinement_chunk_indices(
         raise ValueError("threshold must be finite and in [0, 1]")
     if max_chunks == 0 or not chunks:
         return []
+    if sidekick_salience_by_index is not None and visual_salience_by_index is not None:
+        raise ValueError("provide one sidekick salience map only")
+    salience = sidekick_salience_by_index or visual_salience_by_index or {}
 
-    salience = visual_salience_by_index or {}
     scored: dict[int, float] = {}
     for chunk in chunks:
         score = chunk_refinement_priority(
             graph,
             chunk,
-            visual_salience=float(salience.get(chunk.chunk_index, 0.0)),
+            sidekick_salience=float(salience.get(chunk.chunk_index, 0.0)),
         )
         if score >= threshold:
             scored[chunk.chunk_index] = score
     if not scored:
         return []
 
-    # Coverage-aware allocation: relevance/ambiguity dominates, but a diversity
-    # bonus prevents all dense re-observations from collapsing onto one temporal
-    # neighborhood when several segments have near-equal priority.
+    # AKS/FOCUS-style coverage safeguard: evidence priority dominates, while a
+    # temporal diversity bonus prevents a fixed budget from collapsing onto one
+    # neighborhood when several candidates are near-tied.
     indices = sorted(scored)
     span = max(1, max(indices) - min(indices))
     selected: list[int] = []
@@ -219,14 +271,7 @@ def select_confirmation_span_indices(
     max_segments: int = 2,
     max_span_seconds: float = 40.0,
 ) -> list[int]:
-    """Propose one contiguous span for isolated hard-evidence confirmation.
-
-    Cross-segment unions are used only to *propose* a span. They never become
-    final CQHG evidence. The selected contiguous span is subsequently sent to a
-    clean single-span VLM request, which must re-observe and verify the complete
-    query from scratch. This handles events split across a boundary without ever
-    allowing distant E1/E2 stitching.
-    """
+    """Propose a short contiguous span for isolated hard-evidence confirmation."""
 
     if not chunks:
         return []
@@ -238,6 +283,7 @@ def select_confirmation_span_indices(
     ordered = sorted(chunks, key=lambda item: (item.start_time, item.end_time, item.chunk_index))
     best_indices: list[int] = [ordered[0].chunk_index]
     best_score = float("-inf")
+    best_duration = ordered[0].end_time - ordered[0].start_time
 
     for start in range(len(ordered)):
         for length in range(1, max_segments + 1):
@@ -245,8 +291,6 @@ def select_confirmation_span_indices(
             if stop > len(ordered):
                 break
             group = ordered[start:stop]
-            # Event-aware segments are contiguous in time. Refuse any accidental
-            # gap rather than allowing non-local evidence composition.
             if any(right.start_time > left.end_time + 1e-6 for left, right in zip(group, group[1:])):
                 break
             duration = group[-1].end_time - group[0].start_time
@@ -262,8 +306,6 @@ def select_confirmation_span_indices(
                 (1.0 - float(item.query_uncertainty)) * float(item.query_support)
                 for item in group
             )
-            # Adjacent partial events receive a proposal bonus, but only isolated
-            # confirmation can turn this proposal into hard query evidence.
             proposal_score = (
                 0.50 * best_local
                 + 0.25 * union_coverage
@@ -272,16 +314,10 @@ def select_confirmation_span_indices(
             )
             indices = [item.chunk_index for item in group]
             tie_key = (proposal_score, -duration, -indices[0])
-            best_tie = (
-                best_score,
-                -(
-                    max(chunk.end_time for chunk in ordered if chunk.chunk_index in best_indices)
-                    - min(chunk.start_time for chunk in ordered if chunk.chunk_index in best_indices)
-                ),
-                -best_indices[0],
-            )
-            if tie_key > best_tie:
+            best_key = (best_score, -best_duration, -best_indices[0])
+            if tie_key > best_key:
                 best_score = proposal_score
+                best_duration = duration
                 best_indices = indices
     return best_indices
 
@@ -297,13 +333,7 @@ def aggregate_chunk_evidence(
     confirmed_chunk_indices: Optional[list[int]] = None,
     segment_trace: Optional[list[TemporalSegmentTrace]] = None,
 ) -> WorldEvidenceBundle:
-    """Aggregate evidence without promoting cross-segment proposals to facts.
-
-    When isolated confirmation is available, all hard CQHG fields and prospective
-    world evidence come from that one clean contiguous request. Otherwise this
-    function retains the previous single-anchor behavior for tests/backends that
-    do not implement the confirmation stage.
-    """
+    """Aggregate evidence without promoting cross-segment proposals to facts."""
 
     if context_radius < 0:
         raise ValueError("context_radius must be non-negative")
@@ -389,7 +419,7 @@ def aggregate_chunk_evidence(
 
 
 class OpenAIWorldEvidenceBackend:
-    """APEI observer with dense sidekick segmentation and isolated confirmation."""
+    """APEI observer with hybrid sidekick segmentation and isolated confirmation."""
 
     def __init__(
         self,
@@ -463,6 +493,8 @@ class OpenAIWorldEvidenceBackend:
         refinement_threshold: float = 0.30,
         sidekick_scan_fps: float = 2.0,
         sidekick_max_frames: int = 512,
+        sidekick_visual_weight: float = 0.5,
+        sidekick_semantic_weight: float = 0.5,
         event_min_seconds: float = 4.0,
         event_boundary_quantile: float = 0.80,
         confirmation_frames: int = 16,
@@ -470,7 +502,6 @@ class OpenAIWorldEvidenceBackend:
         confirmation_max_seconds: float = 40.0,
         num_frames: Optional[int] = None,
     ) -> WorldEvidenceBundle:
-        # ``num_frames`` is accepted only as a compatibility alias for the old API.
         if num_frames is not None:
             frames_per_chunk = num_frames
         if not 1 <= frames_per_chunk <= MAX_FRAMES_PER_CHUNK:
@@ -491,8 +522,6 @@ class OpenAIWorldEvidenceBackend:
             raise ValueError(f"chunks_per_request * frames_per_chunk must not exceed {MAX_TOTAL_FRAMES_PER_REQUEST}")
         if not math.isfinite(target_chunk_seconds) or target_chunk_seconds <= 0:
             raise ValueError("target_chunk_seconds must be finite and positive")
-        # Retained for API compatibility. Event-aware segmentation replaces fixed
-        # overlapping windows, so this value no longer determines boundaries.
         if not math.isfinite(chunk_overlap) or not 0.0 <= chunk_overlap < 1.0:
             raise ValueError("chunk_overlap must be finite and in [0, 1)")
         if context_radius < 0:
@@ -501,6 +530,14 @@ class OpenAIWorldEvidenceBackend:
             raise ValueError("sidekick_scan_fps must be finite and positive")
         if not 2 <= sidekick_max_frames <= MAX_SIDEKICK_SCAN_FRAMES:
             raise ValueError(f"sidekick_max_frames must be in [2, {MAX_SIDEKICK_SCAN_FRAMES}]")
+        for name, value in (
+            ("sidekick_visual_weight", sidekick_visual_weight),
+            ("sidekick_semantic_weight", sidekick_semantic_weight),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if sidekick_visual_weight + sidekick_semantic_weight <= 0:
+            raise ValueError("at least one sidekick fusion weight must be positive")
         if not math.isfinite(event_min_seconds) or event_min_seconds <= 0:
             raise ValueError("event_min_seconds must be finite and positive")
         if event_min_seconds > target_chunk_seconds:
@@ -518,31 +555,40 @@ class OpenAIWorldEvidenceBackend:
 
         sampler = self._get_sampler(video_path)
 
-        # Stage 1: cheap dense sidekick scan. It uses no query similarity and no
-        # DreamPRVR peak; its only role is to expose temporal visual structure.
-        scan_points = sampler.visual_change_scan(
+        # Stage 1: DeCafNet/KTS/KTV-inspired query-agnostic sidekick.  Raw pixel
+        # change preserves sharp motion/cut cues; cached DreamPRVR representations
+        # provide semantic novelty for low-motion actions.  Neither uses query
+        # similarity and neither may establish relevance by itself.
+        visual_points = sampler.visual_change_scan(
             scan_fps=sidekick_scan_fps,
             max_frames=sidekick_max_frames,
         )
+        semantic_points = _candidate_semantic_scan(candidate, sampler.duration)
+        sidekick_points = fuse_sidekick_scans(
+            sampler.duration,
+            visual_points,
+            semantic_points,
+            visual_weight=sidekick_visual_weight,
+            semantic_weight=sidekick_semantic_weight,
+        )
         segments: list[EventSegment] = build_event_segments(
             sampler.duration,
-            scan_points,
+            sidekick_points,
             min_segment_seconds=event_min_seconds,
             max_segment_seconds=target_chunk_seconds,
             boundary_quantile=event_boundary_quantile,
             max_segments=max_chunks,
         )
-        windows = {
-            segment.index: TimeWindow(segment.start, segment.end)
-            for segment in segments
-        }
-        visual_salience = {segment.index: segment.visual_salience for segment in segments}
+        windows = {segment.index: TimeWindow(segment.start, segment.end) for segment in segments}
+        sidekick_salience = {segment.index: segment.sidekick_salience for segment in segments}
         segment_trace = [
             TemporalSegmentTrace(
                 segment_index=segment.index,
                 start_time=segment.start,
                 end_time=segment.end,
                 visual_salience=segment.visual_salience,
+                semantic_salience=segment.semantic_salience,
+                sidekick_salience=segment.sidekick_salience,
             )
             for segment in segments
         ]
@@ -622,7 +668,6 @@ class OpenAIWorldEvidenceBackend:
                             raise ValueError(
                                 f"span {chunk.chunk_index} timestamps contradict temporal relation {relation_id!r}"
                             )
-
                 canonical_chunks.append(
                     chunk.model_copy(update={"start_time": window.start, "end_time": window.end})
                 )
@@ -642,20 +687,15 @@ class OpenAIWorldEvidenceBackend:
                 raise ValueError("one multimodal request exceeds the configured image budget")
 
             if stage == "coarse":
-                stage_instruction = (
-                    "This is a coarse event-segment pass. Each listed segment is an independent proposal."
-                )
+                stage_instruction = "This is a coarse event-segment pass. Judge each segment independently."
             elif stage == "refinement":
-                stage_instruction = (
-                    "This is a denser re-observation of one ambiguous event segment. Re-evaluate it from scratch."
-                )
+                stage_instruction = "This is a denser re-observation of one ambiguous event segment. Re-evaluate it from scratch."
             elif stage == "confirmation":
                 stage_instruction = (
-                    "This is the FINAL isolated confirmation of one contiguous temporal span. No other video span is "
-                    "visible in this request. Hard CQHG support/relation ids may be returned only if the supplied "
-                    "timestamped frames coherently establish them inside this span."
+                    "This is the FINAL isolated confirmation of one contiguous temporal span. No other video span "
+                    "is visible. Return hard CQHG support only when these timestamped frames establish it."
                 )
-            else:  # pragma: no cover - internal stages are fixed
+            else:
                 raise ValueError(f"unknown observation stage: {stage}")
 
             content: list[dict] = [
@@ -669,14 +709,13 @@ class OpenAIWorldEvidenceBackend:
                         f"Prospective event worlds (soft context):\n{worlds.model_dump_json(indent=2)}\n"
                         "</retrieval_data>\n\n"
                         + stage_instruction
-                        + " Judge every listed span independently. Never carry an event, actor/object identity, "
-                        "temporal relation, or counterfactual fact from one span into another. Missing evidence is "
-                        "uncertainty, not contradiction. For each verified atomic event, provide the best visible "
-                        "event_time_range using the supplied timestamps. A temporal relation may be verified only "
-                        "when both endpoint events are verified and their reported timestamps satisfy that relation. "
-                        "query_support is high only when the complete hard CQHG is coherently supported in the same "
-                        "visible span. Return every requested span index exactly once and one world evidence item for "
-                        "every world id. Preconditions/consequences are soft context; their absence is not contradiction."
+                        + " Never carry an event, identity, relation, or counterfactual fact across spans. "
+                        "Missing evidence is uncertainty, not contradiction. For each verified atomic event, provide "
+                        "the best visible event_time_range using supplied timestamps. Verify temporal relations only "
+                        "when both endpoint events and their timestamps satisfy the relation. query_support is high "
+                        "only when the complete hard CQHG is coherently supported in the same visible span. Return "
+                        "every requested span index exactly once and one world evidence item for every world id. "
+                        "Imagined preconditions/consequences are soft context; their absence is not contradiction."
                     ),
                 }
             ]
@@ -695,9 +734,7 @@ class OpenAIWorldEvidenceBackend:
                     content.append({"type": "text", "text": f"span={span_index} timestamp={ts:.3f}s"})
                     content.append({"type": "image_url", "image_url": {"url": self._frame_to_data_url(frame)}})
                 content.append({"type": "text", "text": f"</span index={span_index}>"})
-            content.append(
-                {"type": "text", "text": "Return only JSON matching this schema:\n" + json.dumps(schema)}
-            )
+            content.append({"type": "text", "text": "Return only JSON matching this schema:\n" + json.dumps(schema)})
 
             raw = request_structured_json(
                 client=self.client,
@@ -706,8 +743,8 @@ class OpenAIWorldEvidenceBackend:
                     {
                         "role": "system",
                         "content": (
-                            "You are a conservative temporal evidence assessor for PRVR. "
-                            "Visible temporal boundaries are hard evidence boundaries; never infer unseen continuity."
+                            "You are a conservative temporal evidence assessor for PRVR. Visible temporal boundaries "
+                            "are hard evidence boundaries; never infer unseen continuity."
                         ),
                     },
                     {"role": "user", "content": content},
@@ -720,23 +757,21 @@ class OpenAIWorldEvidenceBackend:
             )
             return raw.chunks
 
-        # Stage 2: low-cost VLM assessment over variable-length event proposals.
+        # Stage 2: low-cost Qwen assessment over adaptive event proposals.
         coarse_chunks: list[ChunkEvidence] = []
         ordered_indices = sorted(windows)
         for batch_start in range(0, len(ordered_indices), chunks_per_request):
             batch_indices = ordered_indices[batch_start : batch_start + chunks_per_request]
             batch_windows = {idx: windows[idx] for idx in batch_indices}
-            coarse_chunks.extend(
-                request_spans(batch_windows, sample_frames=frames_per_chunk, stage="coarse")
-            )
+            coarse_chunks.extend(request_spans(batch_windows, sample_frames=frames_per_chunk, stage="coarse"))
         coarse_chunks = sorted(coarse_chunks, key=lambda item: item.chunk_index)
 
-        # Stage 3: coverage-aware dense re-observation. High visual salience can
-        # trigger this stage even if the sparse VLM pass was incorrectly certain.
+        # Stage 3: coverage-aware dense re-observation. Hybrid sidekick novelty can
+        # trigger refinement even if the sparse VLM is incorrectly low-uncertainty.
         refinement_indices = select_refinement_chunk_indices(
             graph,
             coarse_chunks,
-            visual_salience_by_index=visual_salience,
+            sidekick_salience_by_index=sidekick_salience,
             max_chunks=max_refinement_chunks,
             threshold=refinement_threshold,
         )
@@ -754,20 +789,17 @@ class OpenAIWorldEvidenceBackend:
         for chunk in refined_chunks:
             by_index[chunk.chunk_index] = chunk
         combined_chunks = [by_index[idx] for idx in sorted(by_index)]
-        combined = ChunkEvidenceBundle(
-            candidate_video_id=candidate.video_id,
-            chunks=combined_chunks,
-        )
+        combined = ChunkEvidenceBundle(candidate_video_id=candidate.video_id, chunks=combined_chunks)
 
-        # Stage 4: adjacent partial segments may propose one contiguous span, but
-        # only a clean single-span request can establish final hard CQHG evidence.
+        # Stage 4: adjacent partial segments may propose a span; only a clean
+        # isolated re-observation can establish final hard CQHG evidence.
         confirmation_indices = select_confirmation_span_indices(
             graph,
             combined_chunks,
             max_segments=confirmation_max_segments,
             max_span_seconds=confirmation_max_seconds,
         )
-        if not confirmation_indices:  # pragma: no cover - combined is non-empty
+        if not confirmation_indices:
             raise RuntimeError("failed to propose an isolated confirmation span")
         confirmation_window = TimeWindow(
             min(windows[idx].start for idx in confirmation_indices),
