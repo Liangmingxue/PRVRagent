@@ -14,7 +14,9 @@ class LLMConfig:
     model: str = "/home/omnisky/xlm/newtask/charttrans-workspace/model/Qwen3-VL-8B-Instruct-FP8"
     timeout: float = 120.0
     temperature: float = 0.0
-    max_tokens: int = 2048
+    # Chunk-local video observation returns one structured record per temporal
+    # chunk and per event world; 2048 tokens can truncate otherwise-valid JSON.
+    max_tokens: int = 4096
     validation_retries: int = 2
     http_max_retries: int = 2
 
