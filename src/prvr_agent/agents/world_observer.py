@@ -129,6 +129,9 @@ class OpenAICoarseWorldObserver:
                     + worlds.model_dump_json(indent=2)
                     + "\n\nEvaluate the supplied sparse global frames conservatively. "
                     "query_satisfaction measures evidence that the CQHG positive hypothesis itself is satisfied. "
+                    "Because these are sparse global frames, if the queried local event is simply not observed, "
+                    "set query_satisfaction near 0.5 and uncertainty high; absence from sampled frames is not proof of absence. "
+                    "Use query_satisfaction below 0.5 only when visible evidence actively supports an incompatible/near-miss interpretation. "
                     "counterfactual_risk measures visible support for a CQHG near-miss instead. "
                     "For each prospective world, estimate support and contradiction for its OPTIONAL context. "
                     "Missing preconditions or consequences in sparse frames are neutral, not contradictions. "
