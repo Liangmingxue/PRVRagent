@@ -3,15 +3,17 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 from .agents.hypothesis_planner import HypothesisPlanner
 from .agents.world_model import MAX_EVENT_WORLDS, EventWorldPlanner
 from .agents.world_observer import (
     MAX_CHUNKS,
     MAX_CHUNKS_PER_REQUEST,
+    MAX_CONFIRMATION_SEGMENTS,
     MAX_FRAMES_PER_CHUNK,
     MAX_REFINEMENT_CHUNKS,
+    MAX_SIDEKICK_SCAN_FRAMES,
     MAX_TOTAL_FRAMES_PER_REQUEST,
     WorldEvidenceBackend,
 )
@@ -22,15 +24,31 @@ from .schemas import Candidate
 @dataclass(frozen=True)
 class PipelineConfig:
     num_worlds: int = 3
+
+    # Coarse VLM observation over event-aware variable-length segments.
     frames_per_chunk: int = 4
-    target_chunk_seconds: float = 20.0
-    chunk_overlap: float = 0.25
+    target_chunk_seconds: float = 20.0  # Maximum event-segment duration.
+    chunk_overlap: float = 0.25  # Compatibility-only; adaptive segments replace fixed overlap.
     max_chunks: int = 64
     chunks_per_request: int = 8
     context_radius: int = 1
+
+    # Cheap dense sidekick used to propose visual event boundaries.
+    sidekick_scan_fps: float = 2.0
+    sidekick_max_frames: int = 512
+    event_min_seconds: float = 4.0
+    event_boundary_quantile: float = 0.80
+
+    # Selective dense re-observation of ambiguous/high-change event segments.
     refinement_frames_per_chunk: int = 12
     max_refinement_chunks: int = 3
     refinement_threshold: float = 0.30
+
+    # Clean single-span confirmation that produces final hard CQHG evidence.
+    confirmation_frames: int = 16
+    confirmation_max_segments: int = 2
+    confirmation_max_seconds: float = 40.0
+
     scoring: ProspectiveConfig = ProspectiveConfig()
 
     def validate(self) -> None:
@@ -45,18 +63,13 @@ class PipelineConfig:
         if not 0 <= self.max_refinement_chunks <= MAX_REFINEMENT_CHUNKS:
             raise ValueError(f"max_refinement_chunks must be in [0, {MAX_REFINEMENT_CHUNKS}]")
         if self.max_refinement_chunks > 0 and self.refinement_frames_per_chunk <= self.frames_per_chunk:
-            raise ValueError("refinement_frames_per_chunk must exceed coarse frames_per_chunk")
+            raise ValueError("refinement_frames_per_chunk must exceed frames_per_chunk")
         if not math.isfinite(self.refinement_threshold) or not 0.0 <= self.refinement_threshold <= 1.0:
             raise ValueError("refinement_threshold must be finite and in [0, 1]")
-        if self.max_refinement_chunks * self.refinement_frames_per_chunk > MAX_TOTAL_FRAMES_PER_REQUEST:
-            raise ValueError(
-                f"max_refinement_chunks * refinement_frames_per_chunk must not exceed "
-                f"{MAX_TOTAL_FRAMES_PER_REQUEST}"
-            )
         if not math.isfinite(self.target_chunk_seconds) or self.target_chunk_seconds <= 0:
             raise ValueError("target_chunk_seconds must be finite and positive")
         if not math.isfinite(self.chunk_overlap) or not 0.0 <= self.chunk_overlap < 1.0:
-            raise ValueError("chunk_overlap must be in [0, 1)")
+            raise ValueError("chunk_overlap must be finite and in [0, 1)")
         if not 1 <= self.max_chunks <= MAX_CHUNKS:
             raise ValueError(f"max_chunks must be in [1, {MAX_CHUNKS}]")
         if not 1 <= self.chunks_per_request <= MAX_CHUNKS_PER_REQUEST:
@@ -67,6 +80,29 @@ class PipelineConfig:
             )
         if self.context_radius < 0:
             raise ValueError("context_radius must be non-negative")
+
+        if not math.isfinite(self.sidekick_scan_fps) or self.sidekick_scan_fps <= 0:
+            raise ValueError("sidekick_scan_fps must be finite and positive")
+        if not 2 <= self.sidekick_max_frames <= MAX_SIDEKICK_SCAN_FRAMES:
+            raise ValueError(f"sidekick_max_frames must be in [2, {MAX_SIDEKICK_SCAN_FRAMES}]")
+        if not math.isfinite(self.event_min_seconds) or self.event_min_seconds <= 0:
+            raise ValueError("event_min_seconds must be finite and positive")
+        if self.event_min_seconds > self.target_chunk_seconds:
+            raise ValueError("event_min_seconds must not exceed target_chunk_seconds")
+        if not math.isfinite(self.event_boundary_quantile) or not 0.0 <= self.event_boundary_quantile <= 1.0:
+            raise ValueError("event_boundary_quantile must be finite and in [0, 1]")
+
+        if not 1 <= self.confirmation_frames <= MAX_FRAMES_PER_CHUNK:
+            raise ValueError(f"confirmation_frames must be in [1, {MAX_FRAMES_PER_CHUNK}]")
+        if not 1 <= self.confirmation_max_segments <= MAX_CONFIRMATION_SEGMENTS:
+            raise ValueError(
+                f"confirmation_max_segments must be in [1, {MAX_CONFIRMATION_SEGMENTS}]"
+            )
+        if not math.isfinite(self.confirmation_max_seconds) or self.confirmation_max_seconds <= 0:
+            raise ValueError("confirmation_max_seconds must be finite and positive")
+        if self.confirmation_max_seconds < self.event_min_seconds:
+            raise ValueError("confirmation_max_seconds must be >= event_min_seconds")
+
         self.scoring.validate()
 
 
@@ -89,7 +125,7 @@ class PRVRAgentReranker:
         world_evidence_backend: WorldEvidenceBackend,
         video_path_resolver: Callable[[str], str | Path],
         *,
-        cfg: PipelineConfig | None = None,
+        cfg: Optional[PipelineConfig] = None,
     ) -> None:
         self.planner = planner
         self.world_planner = world_planner
@@ -134,6 +170,13 @@ class PRVRAgentReranker:
                 refinement_frames_per_chunk=self.cfg.refinement_frames_per_chunk,
                 max_refinement_chunks=self.cfg.max_refinement_chunks,
                 refinement_threshold=self.cfg.refinement_threshold,
+                sidekick_scan_fps=self.cfg.sidekick_scan_fps,
+                sidekick_max_frames=self.cfg.sidekick_max_frames,
+                event_min_seconds=self.cfg.event_min_seconds,
+                event_boundary_quantile=self.cfg.event_boundary_quantile,
+                confirmation_frames=self.cfg.confirmation_frames,
+                confirmation_max_segments=self.cfg.confirmation_max_segments,
+                confirmation_max_seconds=self.cfg.confirmation_max_seconds,
             )
             if evidence.candidate_video_id != candidate.video_id:
                 raise ValueError(
