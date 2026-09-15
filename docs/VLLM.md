@@ -32,10 +32,12 @@ export PRVR_LLM_API_KEY=EMPTY
 export PRVR_LLM_MODEL=/home/omnisky/xlm/newtask/charttrans-workspace/model/Qwen3-VL-8B-Instruct-FP8
 export PRVR_LLM_TIMEOUT=120
 export PRVR_LLM_TEMPERATURE=0
-export PRVR_LLM_MAX_TOKENS=2048
+export PRVR_LLM_MAX_TOKENS=4096
 export PRVR_LLM_VALIDATION_RETRIES=2
 export PRVR_LLM_HTTP_MAX_RETRIES=2
 ```
+
+The 4096-token default is intentional: chunk-local long-video observation returns structured evidence for multiple temporal chunks and multiple event worlds in one response. Lower values may truncate otherwise-valid JSON when the chunk count is high.
 
 Then test connectivity:
 
