@@ -29,17 +29,17 @@ class PipelineConfig:
 class RerankedCandidate:
     candidate: Candidate
     final_score: float
+    graph_score: float
     world_score: float
     assessment: ProspectiveAssessment
 
 
 class PRVRAgentReranker:
-    """CQHG + abductive prospective event-world reranking.
+    """Two-part PRVR reasoning: CQHG satisfaction + prospective event worlds.
 
-    The previous peak-seeded support/refute loop has been removed. Candidates are
-    now evaluated by generating query-conditioned possible event worlds, observing
-    each candidate coarsely, revising world beliefs, and fusing that prospective
-    evidence with the upstream DreamPRVR score.
+    The former peak-seeded support/refute loop is gone. One coarse candidate
+    observation now serves both contributions: it evaluates whether the hard CQHG
+    is satisfied and revises the soft prospective worlds before score fusion.
     """
 
     def __init__(
@@ -76,12 +76,13 @@ class PRVRAgentReranker:
                 video_path=video_path,
                 num_frames=self.cfg.coarse_frames,
             )
-            assessment = revise_world_beliefs(worlds, evidence, self.cfg.scoring)
+            assessment = revise_world_beliefs(graph, worlds, evidence, self.cfg.scoring)
             final_score = fuse_prospective_score(candidate.base_score, assessment, self.cfg.scoring)
             output.append(
                 RerankedCandidate(
                     candidate=candidate,
                     final_score=final_score,
+                    graph_score=assessment.graph_score,
                     world_score=assessment.world_score,
                     assessment=assessment,
                 )
