@@ -1,6 +1,6 @@
 import pytest
 
-from prvr_agent.video.sampler import TimeWindow, build_overlapping_windows
+from prvr_agent.video.sampler import TimeWindow, build_overlapping_windows, uniform_bin_center_indices
 
 
 def test_time_window_rejects_invalid_bounds():
@@ -41,3 +41,14 @@ def test_long_video_never_silently_widens_local_chunks():
 def test_chunk_builder_rejects_invalid_overlap():
     with pytest.raises(ValueError):
         build_overlapping_windows(10.0, overlap=1.0)
+
+
+def test_bin_center_sampling_avoids_wasting_sparse_samples_on_boundaries():
+    indices = uniform_bin_center_indices(0, 19, 4)
+    assert indices == [2, 7, 12, 17]
+    assert indices[0] > 0
+    assert indices[-1] < 19
+
+
+def test_bin_center_sampling_returns_every_frame_when_budget_is_dense():
+    assert uniform_bin_center_indices(5, 8, 10) == [5, 6, 7, 8]
