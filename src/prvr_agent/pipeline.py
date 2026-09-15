@@ -5,153 +5,86 @@ from pathlib import Path
 from typing import Callable
 
 from .agents.hypothesis_planner import HypothesisPlanner
-from .agents.verifier import EvidenceBackend
-from .controller import CandidateEvidenceState, VerificationBudgetConfig, decide_next_action
-from .reranker import ScoreFusionConfig, aggregate_evidence, fuse_candidate_score
+from .agents.world_model import EventWorldPlanner
+from .agents.world_observer import WorldEvidenceBackend
+from .prospective import ProspectiveAssessment, ProspectiveConfig, fuse_prospective_score, revise_world_beliefs
 from .schemas import Candidate
-from .video.sampler import TimeWindow
-
-
-@dataclass(frozen=True)
-class PeakMappingConfig:
-    frame_seconds_per_index: float | None = None
-    clip_seconds_per_index: float | None = None
-
-    def validate(self) -> None:
-        for name, value in (
-            ("frame_seconds_per_index", self.frame_seconds_per_index),
-            ("clip_seconds_per_index", self.clip_seconds_per_index),
-        ):
-            if value is None or value <= 0:
-                raise ValueError(
-                    f"{name} must be configured from the dataset feature-extraction pipeline before verification"
-                )
 
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    top_k_verify: int = 20
-    frames_per_round: int = 8
-    budget: VerificationBudgetConfig = VerificationBudgetConfig()
-    fusion: ScoreFusionConfig = ScoreFusionConfig()
-    peak_mapping: PeakMappingConfig = PeakMappingConfig()
+    num_worlds: int = 3
+    coarse_frames: int = 8
+    scoring: ProspectiveConfig = ProspectiveConfig()
+
+    def validate(self) -> None:
+        if self.num_worlds <= 0:
+            raise ValueError("num_worlds must be positive")
+        if self.coarse_frames <= 0:
+            raise ValueError("coarse_frames must be positive")
+        self.scoring.validate()
 
 
 @dataclass(frozen=True)
 class RerankedCandidate:
     candidate: Candidate
     final_score: float
-    rounds: int
-    uncertainty: float
+    world_score: float
+    assessment: ProspectiveAssessment
 
 
 class PRVRAgentReranker:
+    """CQHG + abductive prospective event-world reranking.
+
+    The previous peak-seeded support/refute loop has been removed. Candidates are
+    now evaluated by generating query-conditioned possible event worlds, observing
+    each candidate coarsely, revising world beliefs, and fusing that prospective
+    evidence with the upstream DreamPRVR score.
+    """
+
     def __init__(
         self,
         planner: HypothesisPlanner,
-        evidence_backend: EvidenceBackend,
+        world_planner: EventWorldPlanner,
+        world_evidence_backend: WorldEvidenceBackend,
         video_path_resolver: Callable[[str], str | Path],
         *,
         cfg: PipelineConfig | None = None,
     ) -> None:
         self.planner = planner
-        self.evidence_backend = evidence_backend
+        self.world_planner = world_planner
+        self.world_evidence_backend = world_evidence_backend
         self.video_path_resolver = video_path_resolver
         self.cfg = cfg or PipelineConfig()
-        self.cfg.peak_mapping.validate()
-        if self.cfg.top_k_verify <= 0:
-            raise ValueError("top_k_verify must be positive")
-        if self.cfg.frames_per_round <= 0:
-            raise ValueError("frames_per_round must be positive")
-
-    def _peak_times(self, candidate: Candidate) -> tuple[float, float]:
-        mapping = self.cfg.peak_mapping
-        assert mapping.clip_seconds_per_index is not None
-        assert mapping.frame_seconds_per_index is not None
-        return (
-            candidate.clip_peak_index * mapping.clip_seconds_per_index,
-            candidate.frame_peak_index * mapping.frame_seconds_per_index,
-        )
-
-    def _window(self, seed: float, round_idx: int) -> TimeWindow:
-        width = self.cfg.budget.initial_window_seconds * (self.cfg.budget.expansion_factor ** round_idx)
-        return TimeWindow(max(0.0, seed - width / 2), seed + width / 2)
-
-    @staticmethod
-    def _local_margin(sorted_candidates: list[Candidate], idx: int) -> float:
-        gaps: list[float] = []
-        if idx > 0:
-            gaps.append(abs(sorted_candidates[idx - 1].base_score - sorted_candidates[idx].base_score))
-        if idx + 1 < len(sorted_candidates):
-            gaps.append(abs(sorted_candidates[idx].base_score - sorted_candidates[idx + 1].base_score))
-        return min(gaps) if gaps else 1.0
+        self.cfg.validate()
 
     def rerank(self, query: str, candidates: list[Candidate]) -> list[RerankedCandidate]:
         if not candidates:
             return []
+
         graph = self.planner.plan(query)
-        sorted_base = sorted(candidates, key=lambda c: c.base_score, reverse=True)
-        verify_set = sorted_base[: self.cfg.top_k_verify]
+        worlds = self.world_planner.imagine(graph, num_worlds=self.cfg.num_worlds)
         output: list[RerankedCandidate] = []
 
-        for idx, candidate in enumerate(verify_set):
-            clip_t, frame_t = self._peak_times(candidate)
-            state = CandidateEvidenceState(
-                candidate=candidate,
-                retrieval_margin=self._local_margin(sorted_base, idx),
-                peak_gap_seconds=abs(clip_t - frame_t),
-            )
-            seed = 0.5 * (clip_t + frame_t)
-            last_uncertainty = 1.0
-            last_verification = None
+        for candidate in candidates:
             video_path = str(self.video_path_resolver(candidate.video_id))
-
-            for round_idx in range(self.cfg.budget.max_rounds):
-                window = self._window(seed, round_idx)
-                support = self.evidence_backend.verify(
-                    query=query,
-                    graph=graph,
-                    candidate=candidate,
-                    video_path=video_path,
-                    window=window,
-                    mode="support",
-                    num_frames=self.cfg.frames_per_round,
-                )
-                refute = self.evidence_backend.verify(
-                    query=query,
-                    graph=graph,
-                    candidate=candidate,
-                    video_path=video_path,
-                    window=window,
-                    mode="refute",
-                    num_frames=self.cfg.frames_per_round,
-                )
-                state.add_round((window.start, window.end), support, refute)
-                last_verification = aggregate_evidence(state.support_evidence, state.refute_evidence)
-                decision = decide_next_action(state, last_verification, self.cfg.budget)
-                last_uncertainty = decision.uncertainty
-                if decision.action == "stop":
-                    break
-
-            if last_verification is None:  # pragma: no cover
-                continue
-            final_score = fuse_candidate_score(candidate.base_score, last_verification, self.cfg.fusion)
+            evidence = self.world_evidence_backend.assess(
+                query=query,
+                graph=graph,
+                worlds=worlds,
+                candidate=candidate,
+                video_path=video_path,
+                num_frames=self.cfg.coarse_frames,
+            )
+            assessment = revise_world_beliefs(worlds, evidence, self.cfg.scoring)
+            final_score = fuse_prospective_score(candidate.base_score, assessment, self.cfg.scoring)
             output.append(
                 RerankedCandidate(
                     candidate=candidate,
                     final_score=final_score,
-                    rounds=state.round_idx,
-                    uncertainty=last_uncertainty,
+                    world_score=assessment.world_score,
+                    assessment=assessment,
                 )
             )
 
-        for candidate in sorted_base[len(verify_set) :]:
-            output.append(
-                RerankedCandidate(
-                    candidate=candidate,
-                    final_score=candidate.base_score,
-                    rounds=0,
-                    uncertainty=1.0,
-                )
-            )
-        return sorted(output, key=lambda x: x.final_score, reverse=True)
+        return sorted(output, key=lambda item: item.final_score, reverse=True)
