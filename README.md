@@ -15,7 +15,7 @@ query
   -> K CQHG-anchored possible event worlds
   -> DreamPRVR top-K candidates
   -> one coarse whole-video observation per candidate
-       -> hard CQHG satisfaction / counterfactual evidence
+       -> hard CQHG event / temporal / identity / counterfactual evidence
        -> soft support / contradiction for each imagined world
   -> event-world posterior belief revision
   -> CQHG + prospective evidence-aware reranking
@@ -38,7 +38,7 @@ APEI: If it is true, how could the event world unfold?
 - a positive hypothesis;
 - counterfactual near-misses such as partial event, temporal reversal, identity break, wrong object, and wrong action.
 
-CQHG is the hard semantic anchor. For each candidate, the visual observer reports `query_support`, `query_contradiction`, and the actually observed atomic-event ids. The CQHG score therefore rewards complete event coverage and penalizes semantic near-misses rather than relying on similarity alone.
+CQHG is the hard semantic anchor. For each candidate, the visual observer reports `query_support`, `query_contradiction`, actually observed atomic-event ids, verified temporal/identity relation ids, and supported counterfactual ids. A multi-event query therefore cannot receive full CQHG credit from event presence alone when its required temporal or identity relation is unverified.
 
 Prospective imagination is not allowed to modify or replace CQHG atomic events.
 
@@ -50,7 +50,7 @@ Prospective imagination is not allowed to modify or replace CQHG atomic events.
 preconditions -> immutable CQHG query event -> consequences
 ```
 
-Each world contains a prior probability and the exact CQHG event ids it anchors. The implementation rejects a generated world if it drops, adds, or renames a CQHG atomic event id.
+Each world contains a prior probability and every CQHG event id exactly once as a hard anchor. The implementation rejects generated worlds that drop, add, duplicate, or rename CQHG atomic-event ids.
 
 `OpenAIWorldEvidenceBackend` then samples coarse frames across the **whole candidate video** and estimates, for each imagined world:
 
@@ -58,15 +58,16 @@ Each world contains a prior probability and the exact CQHG event ids it anchors.
 - visual contradiction;
 - uncertainty.
 
-The imagined preconditions and consequences are soft context. Their absence is not treated as contradiction; only visible conflicting evidence should suppress a world.
+The imagined preconditions and consequences are soft context. Their absence is not treated as contradiction; only visible conflicting evidence should suppress a world. Positive soft-world evidence is also gated by explicit CQHG contradiction so an imagined context cannot rescue a candidate that visibly violates the hard query semantics.
 
-Posterior beliefs are updated with:
+Posterior beliefs follow the evidence-weighted form:
 
 ```text
 log posterior(H_k)
-  = log prior(H_k)
+  ∝ log prior(H_k)
     + beta * support(H_k, V)
     - gamma * contradiction(H_k, V)
+    - uncertainty penalty
 ```
 
 The final score fuses three terms: the original DreamPRVR score, hard CQHG satisfaction, and posterior-weighted prospective world evidence.
@@ -117,7 +118,10 @@ export PRVR_LLM_BASE_URL=http://127.0.0.1:8000/v1
 export PRVR_LLM_API_KEY=EMPTY
 export PRVR_LLM_MODEL=/home/omnisky/xlm/newtask/charttrans-workspace/model/Qwen3-VL-8B-Instruct-FP8
 export PRVR_LLM_TIMEOUT=120
-export PRVR_LLM_TEMPERATURE=0.1
+export PRVR_LLM_TEMPERATURE=0
+export PRVR_LLM_MAX_TOKENS=2048
+export PRVR_LLM_VALIDATION_RETRIES=2
+export PRVR_LLM_HTTP_MAX_RETRIES=2
 ```
 
 Check the server:
@@ -147,7 +151,7 @@ prvr-agent imagine "a man washes his hands and then opens the refrigerator" --nu
 
 ## DreamPRVR integration
 
-The adapter still reproduces the upstream clip/frame max-similarity scores used to rank candidates, but it no longer returns argmax locations:
+The adapter reproduces the upstream clip/frame max-similarity scores used to rank candidates, but it no longer returns argmax locations:
 
 ```python
 from prvr_agent.retriever import DreamPRVRAdapter
@@ -171,7 +175,7 @@ These candidates can then be passed to `PRVRAgentReranker`, which evaluates hard
 This branch is still an MVP research scaffold. Before benchmark reporting, the main remaining work is:
 
 - validate Qwen3-VL CQHG and world generation quality on real TVR / ActivityNet Captions / Charades-STA queries;
-- validate coarse-frame sampling coverage for long videos;
+- validate whether uniform coarse-frame sampling is sufficient for long untrimmed videos without reintroducing peak-seeded reasoning;
 - add benchmark-specific video-id -> path resolution;
 - calibrate `base_weight`, `graph_weight`, `world_weight`, support/contradiction scales on validation data only;
 - add official PRVR R@K / SumR evaluation and ablations against single-caption/query-expansion baselines;
