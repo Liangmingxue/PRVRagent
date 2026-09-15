@@ -24,9 +24,8 @@ class DreamPRVRAdapter:
 
     When the upstream ``video_mask`` is available, the adapter additionally
     exports a *query-agnostic* temporal semantic-change trace derived from the
-    already-computed DreamPRVR frame representations.  APEI uses this trace as a
-    cheap sidekick signal for event-aware observation.  It is deliberately not a
-    retrieval score and never contains an argmax location.
+    already-computed DreamPRVR frame representations. APEI uses this trace only
+    as a cheap sidekick for event-aware observation, never as retrieval evidence.
     """
 
     def __init__(
@@ -102,9 +101,7 @@ class DreamPRVRAdapter:
         if query_vectors.ndim != 2:
             raise ValueError(f"Expected query vectors [query, dim], got {tuple(query_vectors.shape)}")
         if context_features.ndim != 3:
-            raise ValueError(
-                f"Expected inference context [video, location, dim], got {tuple(context_features.shape)}"
-            )
+            raise ValueError(f"Expected inference context [video, location, dim], got {tuple(context_features.shape)}")
         if query_vectors.shape[-1] != context_features.shape[-1]:
             raise ValueError("query/context embedding dimensions do not match")
         if context_features.shape[1] <= 0:
@@ -122,10 +119,8 @@ class DreamPRVRAdapter:
         """Return a query-agnostic semantic novelty curve for ordered frame features.
 
         Each boundary combines adjacent cosine change with a short left-vs-right
-        context change.  The latter makes the signal less brittle than raw
-        adjacent differences while retaining local temporal resolution.  Values
-        are intentionally left on the cosine-distance scale [0, 2]; the observer
-        performs robust per-video normalization when fusing modalities.
+        context change. This is a lightweight KTS-inspired feature-change signal,
+        not an implementation of the full KTS dynamic-programming objective.
         """
 
         try:
@@ -150,12 +145,8 @@ class DreamPRVRAdapter:
             return [0.0]
 
         adjacent = 1.0 - torch.sum(x[1:] * x[:-1], dim=-1)
-        adjacent = torch.clamp(adjacent, min=0.0, max=2.0)
-        scores[1:] = adjacent
+        scores[1:] = torch.clamp(adjacent, min=0.0, max=2.0)
 
-        # KTS-style semantic segmentation is motivated by changes in local feature
-        # distributions, not only individual frames.  Approximate that principle
-        # cheaply by comparing normalized means on the two sides of each boundary.
         for boundary in range(1, length):
             left = x[max(0, boundary - radius) : boundary].mean(dim=0, keepdim=True)
             right = x[boundary : min(length, boundary + radius)].mean(dim=0, keepdim=True)
@@ -177,9 +168,6 @@ class DreamPRVRAdapter:
 
         video_mask = self.context_info.get("video_mask")
         if video_mask is None:
-            # Upstream DreamPRVR exposes this mask.  Keep a conservative fallback
-            # for custom adapters instead of guessing which zero-padded locations
-            # are valid and accidentally creating a fake end-of-video boundary.
             return None
 
         frame_features = self.context_info["video_feat"][video_index]
@@ -196,13 +184,16 @@ class DreamPRVRAdapter:
         if valid_length <= 0:
             return None
 
-        # DreamPRVR's public collate path pads valid positions then marks them with
-        # a prefix mask; boolean indexing also remains safe for custom sparse masks.
-        valid_features = frame_features[valid]
-        scores = self._semantic_change_curve(
-            valid_features,
-            radius=self.semantic_sidekick_radius,
-        )
+        # The public DreamPRVR collate path uses a contiguous valid prefix followed
+        # by padding. Enforce that contract: compressing an arbitrary sparse mask
+        # would make temporally distant features adjacent and invent a false
+        # semantic transition for the sidekick.
+        expected_valid = torch.arange(valid.numel(), device=valid.device) < valid_length
+        if not torch.equal(valid.reshape(-1), expected_valid):
+            raise ValueError("DreamPRVR video_mask valid positions must form one contiguous prefix")
+        valid_features = frame_features[:valid_length]
+
+        scores = self._semantic_change_curve(valid_features, radius=self.semantic_sidekick_radius)
         payload: dict[str, object] = {
             "source": "dreamprvr_encoded_frame_feat",
             "valid_length": valid_length,
