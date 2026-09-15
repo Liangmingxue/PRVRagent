@@ -80,13 +80,28 @@ def test_semantic_sidekick_mask_excludes_padded_tail():
         ]]),
         "video_mask": torch.tensor([[1.0, 1.0, 1.0, 1.0, 0.0, 0.0]]),
     }
-    # Clip/frame dimensions must agree for the adapter contract.
-    context["video_proposal_feat"] = torch.tensor([[[1.0, 0.0]]])
     adapter = DreamPRVRAdapter(FakeModel(), context)
     candidate = adapter.retrieve(torch.tensor([[1.0, 0.0]]), None, top_k=1).candidates[0][0]
     payload = candidate.metadata[SEMANTIC_SIDEKICK_METADATA_KEY]
     assert payload["valid_length"] == 4
     assert len(payload["change_scores"]) == 4
+
+
+def test_semantic_sidekick_rejects_sparse_mask_that_breaks_chronology():
+    context = {
+        "video_metas": ["v0"],
+        "video_proposal_feat": torch.tensor([[[1.0, 0.0]]]),
+        "video_feat": torch.tensor([[
+            [1.0, 0.0],
+            [0.5, 0.5],
+            [0.0, 1.0],
+            [1.0, 1.0],
+        ]]),
+        "video_mask": torch.tensor([[1.0, 0.0, 1.0, 0.0]]),
+    }
+    adapter = DreamPRVRAdapter(FakeModel(), context)
+    with pytest.raises(ValueError, match="contiguous prefix"):
+        adapter.retrieve(torch.tensor([[1.0, 0.0]]), None, top_k=1)
 
 
 def test_custom_context_without_mask_falls_back_without_semantic_trace():
