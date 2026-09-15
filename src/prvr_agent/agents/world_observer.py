@@ -24,6 +24,7 @@ MAX_FRAMES_PER_CHUNK = 16
 MAX_CHUNKS = 96
 MAX_CHUNKS_PER_REQUEST = 16
 MAX_TOTAL_FRAMES_PER_REQUEST = 64
+MAX_REFINEMENT_CHUNKS = 8
 # Backward-compatible name for callers that imported the old constant.
 MAX_COARSE_FRAMES = MAX_FRAMES_PER_CHUNK
 
@@ -43,6 +44,9 @@ class WorldEvidenceBackend(Protocol):
         max_chunks: int,
         chunks_per_request: int,
         context_radius: int,
+        refinement_frames_per_chunk: int,
+        max_refinement_chunks: int,
+        refinement_threshold: float,
     ) -> WorldEvidenceBundle: ...
 
 
@@ -51,12 +55,104 @@ def _relation_endpoints(graph: QueryHypothesisGraph) -> dict[str, tuple[str, str
     return {rel.id: (rel.event_a, rel.event_b) for rel in relations}
 
 
+def chunk_refinement_priority(graph: QueryHypothesisGraph, chunk: ChunkEvidence) -> float:
+    """Estimate whether a coarse chunk deserves a denser APEI observation.
+
+    Refinement is driven only by chunk-local evidence: uncertainty, partial CQHG
+    coverage, unresolved relations, and soft prospective-world hints. Retrieval
+    peaks are deliberately absent. A completely unseen but highly uncertain
+    chunk can still receive a moderate priority, which helps recover short events
+    that fall between sparse coarse samples.
+    """
+
+    valid_events = {event.id for event in graph.atomic_events}
+    event_coverage = len(valid_events.intersection(chunk.verified_event_ids)) / len(valid_events)
+
+    valid_relations = {
+        rel.id for rel in list(graph.temporal_constraints) + list(graph.identity_constraints)
+    }
+    if valid_relations:
+        relation_coverage = len(valid_relations.intersection(chunk.verified_relation_ids)) / len(valid_relations)
+    else:
+        relation_coverage = 1.0
+
+    partial_event = 4.0 * event_coverage * (1.0 - event_coverage)
+    unresolved_relation = max(0.0, event_coverage - relation_coverage) if valid_relations else 0.0
+    world_hint = max(
+        (
+            max(0.0, (1.0 - float(item.uncertainty)) * (float(item.support) - float(item.contradiction)))
+            for item in chunk.evidence
+        ),
+        default=0.0,
+    )
+    support_conflict = 2.0 * min(float(chunk.query_support), float(chunk.query_contradiction))
+    uncertainty = float(chunk.query_uncertainty)
+
+    priority = (
+        0.35 * uncertainty
+        + 0.25 * partial_event
+        + 0.20 * unresolved_relation
+        + 0.15 * world_hint
+        + 0.05 * support_conflict
+    )
+    return max(0.0, min(1.0, priority))
+
+
+def select_refinement_chunk_indices(
+    graph: QueryHypothesisGraph,
+    chunks: list[ChunkEvidence],
+    *,
+    max_chunks: int = 3,
+    threshold: float = 0.30,
+) -> list[int]:
+    """Select a small, temporally diverse set of ambiguous chunks for refinement."""
+
+    if max_chunks < 0:
+        raise ValueError("max_chunks must be non-negative")
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("threshold must be in [0, 1]")
+    if max_chunks == 0 or not chunks:
+        return []
+
+    scored = {
+        chunk.chunk_index: chunk_refinement_priority(graph, chunk)
+        for chunk in chunks
+        if chunk_refinement_priority(graph, chunk) >= threshold
+    }
+    if not scored:
+        return []
+
+    # When many chunks have similarly high uncertainty, choose temporally spread
+    # chunks instead of always refining the earliest ones. Evidence priority still
+    # dominates; diversity only breaks near-ties.
+    indices = sorted(scored)
+    span = max(1, max(indices) - min(indices))
+    selected: list[int] = []
+    while scored and len(selected) < max_chunks:
+        if not selected:
+            best = max(scored, key=lambda idx: (scored[idx], -idx))
+        else:
+            best = max(
+                scored,
+                key=lambda idx: (
+                    scored[idx]
+                    + 0.08 * min(abs(idx - chosen) for chosen in selected) / span,
+                    scored[idx],
+                    -idx,
+                ),
+            )
+        selected.append(best)
+        scored.pop(best)
+    return sorted(selected)
+
+
 def aggregate_chunk_evidence(
     graph: QueryHypothesisGraph,
     worlds: EventWorldSet,
     bundle: ChunkEvidenceBundle,
     *,
     context_radius: int = 1,
+    refined_chunk_indices: list[int] | None = None,
 ) -> WorldEvidenceBundle:
     """Aggregate chunks without ever unioning hard CQHG facts across time.
 
@@ -134,12 +230,13 @@ def aggregate_chunk_evidence(
         supported_counterfactual_ids=list(anchor.supported_counterfactual_ids),
         evidence=aggregated_world_evidence,
         anchor_chunk_index=anchor.chunk_index,
+        refined_chunk_indices=sorted(refined_chunk_indices or []),
         chunk_evidence=list(bundle.chunks),
     )
 
 
 class OpenAIWorldEvidenceBackend:
-    """Observe a long candidate as bounded overlapping chunks for CQHG + APEI."""
+    """Observe long candidates with coarse chunks plus selective dense refinement."""
 
     def __init__(
         self,
@@ -208,6 +305,9 @@ class OpenAIWorldEvidenceBackend:
         max_chunks: int = 64,
         chunks_per_request: int = 8,
         context_radius: int = 1,
+        refinement_frames_per_chunk: int = 12,
+        max_refinement_chunks: int = 3,
+        refinement_threshold: float = 0.30,
         num_frames: int | None = None,
     ) -> WorldEvidenceBundle:
         # ``num_frames`` is accepted only as a compatibility alias for the old API.
@@ -215,6 +315,20 @@ class OpenAIWorldEvidenceBackend:
             frames_per_chunk = num_frames
         if not 1 <= frames_per_chunk <= MAX_FRAMES_PER_CHUNK:
             raise ValueError(f"frames_per_chunk must be in [1, {MAX_FRAMES_PER_CHUNK}]")
+        if not 1 <= refinement_frames_per_chunk <= MAX_FRAMES_PER_CHUNK:
+            raise ValueError(
+                f"refinement_frames_per_chunk must be in [1, {MAX_FRAMES_PER_CHUNK}]"
+            )
+        if max_refinement_chunks > 0 and refinement_frames_per_chunk <= frames_per_chunk:
+            raise ValueError("refinement_frames_per_chunk must exceed coarse frames_per_chunk")
+        if not 0 <= max_refinement_chunks <= MAX_REFINEMENT_CHUNKS:
+            raise ValueError(f"max_refinement_chunks must be in [0, {MAX_REFINEMENT_CHUNKS}]")
+        if not 0.0 <= refinement_threshold <= 1.0:
+            raise ValueError("refinement_threshold must be in [0, 1]")
+        if max_refinement_chunks * refinement_frames_per_chunk > MAX_TOTAL_FRAMES_PER_REQUEST:
+            raise ValueError(
+                f"max_refinement_chunks * refinement_frames_per_chunk must not exceed {MAX_TOTAL_FRAMES_PER_REQUEST}"
+            )
         if not 1 <= max_chunks <= MAX_CHUNKS:
             raise ValueError(f"max_chunks must be in [1, {MAX_CHUNKS}]")
         if not 1 <= chunks_per_request <= MAX_CHUNKS_PER_REQUEST:
@@ -244,11 +358,22 @@ class OpenAIWorldEvidenceBackend:
         }
         relation_endpoints = _relation_endpoints(graph)
         valid_counterfactual_ids = {cf.id for cf in graph.counterfactuals}
-        all_chunks: list[ChunkEvidence] = []
 
-        for batch_start in range(0, len(windows), chunks_per_request):
-            batch_indices = list(range(batch_start, min(batch_start + chunks_per_request, len(windows))))
-            expected_chunk_indices = set(batch_indices)
+        def request_chunk_batch(
+            chunk_indices: list[int],
+            *,
+            sample_frames: int,
+            stage: str,
+        ) -> list[ChunkEvidence]:
+            expected_chunk_indices = set(chunk_indices)
+            stage_instruction = (
+                "This is the coarse coverage pass."
+                if stage == "coarse"
+                else (
+                    "This is a denser second observation of ambiguous chunks. Re-evaluate each chunk independently "
+                    "from these denser frames; do not assume the earlier coarse judgment was correct."
+                )
+            )
             content: list[dict] = [
                 {
                     "type": "text",
@@ -259,26 +384,26 @@ class OpenAIWorldEvidenceBackend:
                         f"CQHG (hard query semantics):\n{graph.model_dump_json(indent=2)}\n\n"
                         f"Prospective event worlds (soft context):\n{worlds.model_dump_json(indent=2)}\n"
                         "</retrieval_data>\n\n"
-                        "This request contains several bounded temporal chunks from the same video. Judge EVERY "
-                        "chunk independently. Never carry an event, actor/object identity, temporal relation, or "
-                        "counterfactual fact from one chunk into another. A temporal/identity relation may be "
-                        "verified only when both endpoint atomic events are supported inside that SAME chunk. "
-                        "query_support is high only when the complete hard CQHG is coherently supported inside one "
-                        "chunk. Missing evidence is uncertainty, not contradiction. Return every listed chunk index "
-                        "exactly once. Copy its start_time/end_time from the chunk label. For each chunk return one "
-                        "world evidence item for every world id. Preconditions/consequences are soft context; their "
-                        "absence is not contradiction. Keep observations concise."
+                        + stage_instruction
+                        + " Judge EVERY listed bounded temporal chunk independently. Never carry an event, "
+                        "actor/object identity, temporal relation, or counterfactual fact from one chunk into another. "
+                        "A temporal/identity relation may be verified only when both endpoint atomic events are "
+                        "supported inside that SAME chunk. query_support is high only when the complete hard CQHG "
+                        "is coherently supported inside one chunk. Missing evidence is uncertainty, not contradiction. "
+                        "Return every listed chunk index exactly once. For each chunk return one world evidence item "
+                        "for every world id. Preconditions/consequences are soft context; their absence is not "
+                        "contradiction. Keep observations concise."
                     ),
                 }
             ]
-            for chunk_index in batch_indices:
+            for chunk_index in chunk_indices:
                 window = windows[chunk_index]
-                timestamps, frames = sampler.sample(window, frames_per_chunk)
+                timestamps, frames = sampler.sample(window, sample_frames)
                 content.append(
                     {
                         "type": "text",
                         "text": (
-                            f"<chunk index={chunk_index} start={window.start:.6f} end={window.end:.6f}>\n"
+                            f"<chunk index={chunk_index} start={window.start:.6f} end={window.end:.6f} stage={stage}>\n"
                             "Only the following images belong to this chunk."
                         ),
                     }
@@ -326,9 +451,8 @@ class OpenAIWorldEvidenceBackend:
                             raise ValueError(
                                 f"chunk {chunk.chunk_index} verified relation {relation_id!r} without both endpoint events"
                             )
-                    # Chunk index is the authoritative boundary key. Canonicalize
-                    # model-echoed floating-point bounds to the sampler's exact values
-                    # so harmless decimal rounding cannot break a valid response.
+                    # Chunk index is authoritative. Canonicalize model-echoed
+                    # floating-point bounds so harmless rounding cannot fail.
                     window = windows[chunk.chunk_index]
                     canonical_chunks.append(
                         chunk.model_copy(update={"start_time": window.start, "end_time": window.end})
@@ -356,10 +480,41 @@ class OpenAIWorldEvidenceBackend:
                 validation_retries=self.validation_retries,
                 validator=validate_evidence,
             )
-            all_chunks.extend(raw_batch.chunks)
+            return raw_batch.chunks
 
+        coarse_chunks: list[ChunkEvidence] = []
+        for batch_start in range(0, len(windows), chunks_per_request):
+            batch_indices = list(range(batch_start, min(batch_start + chunks_per_request, len(windows))))
+            coarse_chunks.extend(
+                request_chunk_batch(batch_indices, sample_frames=frames_per_chunk, stage="coarse")
+            )
+        coarse_chunks = sorted(coarse_chunks, key=lambda item: item.chunk_index)
+
+        refinement_indices = select_refinement_chunk_indices(
+            graph,
+            coarse_chunks,
+            max_chunks=max_refinement_chunks,
+            threshold=refinement_threshold,
+        )
+        refined_chunks: list[ChunkEvidence] = []
+        if refinement_indices:
+            refined_chunks = request_chunk_batch(
+                refinement_indices,
+                sample_frames=refinement_frames_per_chunk,
+                stage="refinement",
+            )
+
+        by_index = {chunk.chunk_index: chunk for chunk in coarse_chunks}
+        for chunk in refined_chunks:
+            by_index[chunk.chunk_index] = chunk
         combined = ChunkEvidenceBundle(
             candidate_video_id=candidate.video_id,
-            chunks=sorted(all_chunks, key=lambda item: item.chunk_index),
+            chunks=[by_index[idx] for idx in sorted(by_index)],
         )
-        return aggregate_chunk_evidence(graph, worlds, combined, context_radius=context_radius)
+        return aggregate_chunk_evidence(
+            graph,
+            worlds,
+            combined,
+            context_radius=context_radius,
+            refined_chunk_indices=refinement_indices,
+        )
