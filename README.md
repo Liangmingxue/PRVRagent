@@ -3,7 +3,7 @@
 Research scaffold for **Partially Relevant Video Retrieval (PRVR)** built around two ideas only:
 
 1. **Counterfactual Query Hypothesis Graph (CQHG)**: represent what must be true for the query to be fully satisfied, together with structured semantic near-misses.
-2. **Abductive Prospective Event World Modeling (APEI)**: before fine-grained alignment, imagine several plausible event worlds in which the query could occur, then revise their probabilities using temporally coherent evidence from each candidate video.
+2. **Abductive Prospective Event World Modeling (APEI)**: before fine-grained alignment, imagine several plausible event worlds in which the query could occur, then revise their probabilities using temporally coherent candidate-video evidence.
 
 The previous peak-seeded / local-spurious-response contribution has been removed from the agent design. Counterfactual near-miss reasoning is retained because it is part of CQHG, not a separate third contribution.
 
@@ -14,12 +14,13 @@ query
   -> Counterfactual Query Hypothesis Graph
   -> K CQHG-anchored possible event worlds
   -> DreamPRVR top-K candidates
-  -> bounded overlapping temporal chunks covering each candidate video
-       -> chunk-local hard CQHG event / relation / counterfactual evidence
-       -> chunk-local soft support / contradiction for each imagined world
-       -> process long videos in several bounded chunk batches when necessary
-  -> choose one coherent CQHG anchor chunk
-  -> revise event-world beliefs only from the anchor neighborhood
+  -> cheap dense visual sidekick scan over each candidate video
+  -> event-aware variable-length temporal segments
+  -> coarse CQHG + event-world assessment per segment
+  -> coverage-aware dense re-observation of ambiguous/high-change segments
+  -> choose one short contiguous candidate span
+  -> isolated single-span temporal confirmation with explicit event timestamps
+  -> revise event-world beliefs from confirmed evidence
   -> CQHG + prospective evidence-aware reranking
 ```
 
@@ -32,19 +33,13 @@ APEI: If it is true, how could the event world unfold?
 
 ## Innovation 1: Counterfactual Query Hypothesis Graph
 
-`OpenAIHypothesisPlanner` decomposes the query into:
+`OpenAIHypothesisPlanner` decomposes the query into atomic events, temporal constraints, identity constraints, a positive hypothesis, and structured counterfactual near-misses such as partial event, temporal reversal, identity break, wrong object, and wrong action.
 
-- atomic events;
-- temporal constraints;
-- identity constraints;
-- a positive hypothesis;
-- counterfactual near-misses such as partial event, temporal reversal, identity break, wrong object, and wrong action.
+CQHG is the hard semantic anchor. The visual observer reports `query_support`, `query_contradiction`, observed atomic-event ids, verified temporal/identity relation ids, supported counterfactual ids, and timestamp ranges for visible atomic events. A multi-event query therefore cannot receive full CQHG credit from event presence alone when its required temporal or identity relation is unverified.
 
-CQHG is the hard semantic anchor. For each temporal chunk, the visual observer reports `query_support`, `query_contradiction`, actually observed atomic-event ids, verified temporal/identity relation ids, and supported counterfactual ids. A multi-event query therefore cannot receive full CQHG credit from event presence alone when its required temporal or identity relation is unverified.
+Hard CQHG evidence is never formed by unioning distant observations. In particular, `E1` near 10 s and `E2` near 90 s cannot be mechanically composed into a complete `E1 -> E2` match. A temporal relation is accepted only when both endpoint events are verified inside the same visible confirmation span and their explicit timestamp ranges satisfy the relation.
 
-Hard CQHG evidence is never unioned across distant chunks. For example, observing `E1` near 10 s and `E2` near 90 s does not produce a complete `E1 -> E2` query match unless one coherent bounded chunk itself supports the required event composition and relation.
-
-Prospective imagination is not allowed to modify or replace CQHG atomic events **or** its temporal/identity relations.
+Prospective imagination is not allowed to modify or replace CQHG atomic events or temporal/identity relations.
 
 ## Innovation 2: Abductive Prospective Event World Modeling
 
@@ -54,11 +49,21 @@ Prospective imagination is not allowed to modify or replace CQHG atomic events *
 preconditions -> immutable CQHG query event -> consequences
 ```
 
-Each world contains a prior probability, every CQHG atomic-event id exactly once, and every CQHG temporal/identity relation id exactly once as hard anchors. The implementation rejects generated worlds that drop, add, duplicate, rename, or reverse these CQHG anchors.
+Each world contains a prior probability, every CQHG atomic-event id exactly once, and every CQHG temporal/identity relation id exactly once as hard anchors. Generated worlds that drop, add, duplicate, rename, or reverse these anchors are rejected.
 
-For long-video observation, `OpenAIWorldEvidenceBackend` no longer treats a uniformly sampled whole video as one evidence pool. It covers the full video with **bounded overlapping temporal chunks** and asks the multimodal model to judge every chunk independently. The chunk width is approximately configurable (`target_chunk_seconds`, default 20 s), overlap reduces boundary splits, and long videos are processed in multiple chunk batches rather than silently widening a chunk. If the configured `max_chunks` is too small to preserve the requested local temporal resolution, the code fails explicitly instead of degrading locality.
+### Event-aware Observe -> Revise
 
-The hard CQHG score is taken from one coherent anchor chunk only. APEI soft context may use the anchor chunk and a small neighboring radius, allowing local preconditions/consequences to influence posterior revision without allowing distant events to be stitched into one query match. Preconditions and consequences remain soft context: their absence is not contradiction, and uncertainty only reduces evidence strength toward zero.
+The long-video observer no longer relies on one whole-video uniform sample or fixed DreamPRVR peak locations. It now uses four APEI-internal observation stages.
+
+**1. Cheap dense sidekick scan.** `DecordFrameSampler.visual_change_scan()` samples the full video at a relatively dense but inexpensive rate and computes low-resolution luminance-change scores. This stage is query-agnostic and therefore does not recreate a query-similarity peak. Its only purpose is to expose temporal visual structure.
+
+**2. Adaptive event segmentation.** `build_event_segments()` turns local visual-change maxima into variable-length event proposals while enforcing a maximum segment duration. Quiet regions are force-split instead of silently becoming extremely long segments. The default maximum event-segment duration is 20 s and the default minimum duration is 4 s.
+
+**3. Coverage-aware dense re-observation.** Every event segment receives a low-cost VLM pass. A small number of segments are re-observed with more frames according to a priority combining sidekick visual salience, partial CQHG coverage, unresolved relations, Qwen uncertainty, support/contradiction conflict, and prospective-world hints. High sidekick salience can therefore trigger refinement even when the first sparse Qwen pass is incorrectly overconfident. Temporal diversity prevents all refinement budget from collapsing onto one neighborhood.
+
+**4. Isolated contiguous-span confirmation.** Adjacent partial event segments may jointly propose one short contiguous span, but their evidence is not directly unioned into the final CQHG score. The proposed span is sent to a clean Qwen request that contains only that span. Final hard event/relation evidence must be re-observed from scratch in this isolated request. This prevents cross-attention between distant segments in a batched coarse request from becoming final evidence, while still allowing a true event that straddles one adaptive boundary to be confirmed.
+
+The confirmation request also asks for `event_time_ranges`. Temporal relations are checked in code against these timestamps before they are accepted.
 
 Posterior beliefs follow the evidence-weighted form:
 
@@ -83,14 +88,15 @@ The following former components are no longer part of the intended method:
 - retrieval/verification joint uncertainty budget;
 - the old standalone peak-based support/refute reranker.
 
-DreamPRVR still uses its own internal max-similarity mechanism to produce its normal retrieval scores, but PRVR-Agent no longer exports or reasons from those argmax locations. The new temporal chunks are deterministic full-video coverage inside APEI, not retrieval-peak proposals.
+DreamPRVR still uses its own internal max-similarity mechanism to produce its normal retrieval scores, but PRVR-Agent no longer exports or reasons from those argmax locations. The dense sidekick and adaptive segmentation are full-video APEI observation mechanisms, not retrieval-peak proposals.
 
 ## Main modules
 
 - `src/prvr_agent/agents/hypothesis_planner.py`: CQHG generation.
 - `src/prvr_agent/agents/world_model.py`: abductive prospective event-world generation.
-- `src/prvr_agent/agents/world_observer.py`: chunk-local CQHG/world evidence, batched long-video observation, and coherence-preserving aggregation.
-- `src/prvr_agent/video/sampler.py`: bounded overlapping full-video temporal coverage and raw-frame sampling.
+- `src/prvr_agent/agents/world_observer.py`: coarse event assessment, coverage-aware refinement, isolated confirmation, and coherence-preserving aggregation.
+- `src/prvr_agent/video/event_segments.py`: visual sidekick event-boundary proposals and adaptive segment construction.
+- `src/prvr_agent/video/sampler.py`: raw-video frame sampling and dense low-resolution visual-change scan.
 - `src/prvr_agent/prospective.py`: CQHG scoring, prior normalization, posterior belief revision, and score fusion.
 - `src/prvr_agent/pipeline.py`: end-to-end CQHG + APEI reranking.
 - `src/prvr_agent/retriever/dreamprvr_adapter.py`: non-invasive DreamPRVR top-K adapter without peak export.
@@ -113,8 +119,6 @@ pip install -e '.[all]'
 The package accepts Python 3.9+ and PyTorch 2.0+ so it can be installed alongside the public DreamPRVR environments; the Qwen3-VL/vLLM server can remain in its own separate environment and is accessed over the OpenAI-compatible endpoint.
 
 ## Local Qwen3-VL / vLLM
-
-The defaults target the local OpenAI-compatible vLLM endpoint already used by this project:
 
 ```bash
 export PRVR_LLM_BASE_URL=http://127.0.0.1:8000/v1
@@ -139,7 +143,7 @@ Generate a CQHG:
 prvr-agent plan-llm "a man washes his hands and then opens the refrigerator"
 ```
 
-Generate prospective event worlds from that query:
+Generate prospective event worlds:
 
 ```bash
 prvr-agent imagine-llm "a man washes his hands and then opens the refrigerator" --num-worlds 3
@@ -154,7 +158,7 @@ prvr-agent imagine "a man washes his hands and then opens the refrigerator" --nu
 
 ## DreamPRVR integration
 
-The adapter reproduces the upstream clip/frame max-similarity scores used to rank candidates, but it no longer returns argmax locations:
+The adapter reproduces upstream clip/frame max-similarity scores used to rank candidates, but it no longer returns argmax locations:
 
 ```python
 from prvr_agent.retriever import DreamPRVRAdapter
@@ -171,16 +175,16 @@ batch = adapter.retrieve(query_feat, query_mask, top_k=20)
 candidates = batch.candidates[0]
 ```
 
-These candidates can then be passed to `PRVRAgentReranker`. Default long-video observation uses 4 frames per approximately 20-second chunk, 25% overlap, at most 64 chunks, and batches 8 chunks per multimodal request. Each request is capped at 64 sampled images by configuration. Soft world-context revision uses only the coherent anchor chunk plus one temporal neighbor on each side.
+Default APEI observation uses a 2 FPS low-resolution sidekick scan capped at 512 frames, adaptive event segments up to 20 s long, 4 VLM frames per coarse segment, up to three 12-frame dense re-observations, and a 16-frame isolated confirmation over at most two adjacent segments / 40 s. These are research defaults and must be calibrated on validation data.
 
 ## Research status
 
 This branch is still an MVP research scaffold. Before benchmark reporting, the main remaining work is:
 
-- validate Qwen3-VL CQHG, chunk evidence, and world generation quality on real TVR / ActivityNet Captions / Charades-STA queries;
-- calibrate chunk duration/overlap/frame density on validation data and study short-event recall versus compute;
-- add an APEI-internal uncertainty-driven dense refinement pass for chunks whose coarse evidence remains ambiguous, without reintroducing retrieval-peak guidance;
+- validate Qwen3-VL CQHG, event timestamp, isolated confirmation, and world-generation quality on real TVR / ActivityNet Captions / Charades-STA queries;
+- calibrate sidekick scan rate, event boundary quantile, segment duration, coarse/refinement/confirmation frame budgets, and compute/recall trade-offs on validation data;
+- compare adaptive event segmentation against the previous fixed-chunk observer and whole-video uniform sampling;
 - add benchmark-specific video-id -> path resolution;
 - calibrate `base_weight`, `graph_weight`, `world_weight`, support/contradiction scales on validation data only;
-- add official PRVR R@K / SumR evaluation and ablations against whole-video coarse observation and single-caption/query-expansion baselines;
-- log anchor chunk, per-chunk CQHG evidence, generated worlds, and posterior changes for qualitative analysis.
+- add official PRVR R@K / SumR evaluation and ablations against single-caption/query-expansion baselines;
+- log segment boundaries, visual salience, refinement choices, confirmation span, CQHG event timestamps, generated worlds, and posterior changes for qualitative analysis.
