@@ -63,6 +63,20 @@ def _normalized_priors(worlds: EventWorldSet) -> dict[str, float]:
     return {world.id: float(world.prior) / total for world in worlds.worlds}
 
 
+def _validate_world_anchors(graph: QueryHypothesisGraph, worlds: EventWorldSet) -> None:
+    if worlds.query != graph.query:
+        raise ValueError("event worlds do not match the CQHG query")
+    expected_events = {event.id for event in graph.atomic_events}
+    expected_relations = {
+        rel.id for rel in list(graph.temporal_constraints) + list(graph.identity_constraints)
+    }
+    for world in worlds.worlds:
+        if set(world.query_anchor_event_ids) != expected_events or len(world.query_anchor_event_ids) != len(expected_events):
+            raise ValueError(f"world {world.id!r} does not preserve the complete CQHG event anchors")
+        if set(world.query_anchor_relation_ids) != expected_relations or len(world.query_anchor_relation_ids) != len(expected_relations):
+            raise ValueError(f"world {world.id!r} does not preserve the complete CQHG relation anchors")
+
+
 def score_cqhg_evidence(
     graph: QueryHypothesisGraph,
     evidence: WorldEvidenceBundle,
@@ -71,8 +85,8 @@ def score_cqhg_evidence(
     """Score complete CQHG satisfaction, including hard relation coverage.
 
     Uncertainty reduces the strength of a judgment toward zero; it is not itself
-    negative evidence. This is important in PRVR because sparse observation of a
-    long video can simply fail to see the relevant local moment.
+    negative evidence. This matters in PRVR because sparse observation of a long
+    video can simply fail to see the relevant local moment.
     """
 
     valid_event_ids = {event.id for event in graph.atomic_events}
@@ -104,6 +118,7 @@ def revise_world_beliefs(
 
     cfg = cfg or ProspectiveConfig()
     cfg.validate()
+    _validate_world_anchors(graph, worlds)
     priors = _normalized_priors(worlds)
     by_id = {item.world_id: item for item in evidence.evidence}
     expected = set(priors)
@@ -145,13 +160,10 @@ def revise_world_beliefs(
                 uncertainty=item.uncertainty,
             )
         )
-        # Uncertain observation should reduce influence rather than behave like a
-        # contradiction. This preserves the "absence of evidence is not evidence
-        # of absence" rule for imagined preconditions/consequences.
         evidence_confidence = max(0.0, 1.0 - item.uncertainty)
         local_score = evidence_confidence * (item.support - item.contradiction)
         # Soft imagined context may help when the hard query is unresolved, but it
-        # must not rescue a candidate that has explicit CQHG contradiction evidence.
+        # must not rescue a candidate with explicit CQHG contradiction evidence.
         if local_score > 0:
             local_score *= positive_world_gate
         world_score += posterior * local_score
