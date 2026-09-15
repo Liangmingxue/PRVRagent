@@ -197,6 +197,7 @@ class WorldEvidenceBundle(StrictModel):
     supported_counterfactual_ids: list[str] = Field(default_factory=list)
     evidence: list[WorldEvidence] = Field(min_length=1)
     anchor_chunk_index: int | None = Field(default=None, ge=0)
+    refined_chunk_indices: list[int] = Field(default_factory=list)
     chunk_evidence: list[ChunkEvidence] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -211,8 +212,12 @@ class WorldEvidenceBundle(StrictModel):
         ):
             if len(ids) != len(set(ids)):
                 raise ValueError(f"{name} must not contain duplicate ids")
-        if self.anchor_chunk_index is not None and self.chunk_evidence:
+        if len(self.refined_chunk_indices) != len(set(self.refined_chunk_indices)):
+            raise ValueError("refined_chunk_indices must not contain duplicates")
+        if self.chunk_evidence:
             valid_indices = {chunk.chunk_index for chunk in self.chunk_evidence}
-            if self.anchor_chunk_index not in valid_indices:
+            if self.anchor_chunk_index is not None and self.anchor_chunk_index not in valid_indices:
                 raise ValueError("anchor_chunk_index must reference one returned chunk")
+            if not set(self.refined_chunk_indices).issubset(valid_indices):
+                raise ValueError("refined_chunk_indices must reference returned chunks")
         return self
