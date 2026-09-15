@@ -49,6 +49,8 @@ class QueryHypothesisGraph(BaseModel):
     @model_validator(mode="after")
     def validate_references(self) -> "QueryHypothesisGraph":
         ids = {e.id for e in self.atomic_events}
+        if len(ids) != len(self.atomic_events):
+            raise ValueError("Atomic event ids must be unique")
         for rel in self.temporal_constraints:
             if rel.event_a not in ids or rel.event_b not in ids:
                 raise ValueError("Temporal constraints must reference existing atomic event ids")
@@ -59,34 +61,61 @@ class QueryHypothesisGraph(BaseModel):
 
 
 class Candidate(BaseModel):
+    """DreamPRVR candidate without any peak-specific state.
+
+    The baseline retriever remains responsible for clip/frame similarity. APEI then
+    reasons over the candidate as a whole rather than treating an argmax location as
+    evidence of relevance.
+    """
+
     video_id: str
     video_index: int
     base_score: float
     clip_score: float
     frame_score: float
-    clip_peak_index: int
-    frame_peak_index: int
     metadata: dict = Field(default_factory=dict)
 
 
-class EvidenceResult(BaseModel):
-    mode: Literal["support", "refute"]
-    matched: bool
-    support: float = Field(ge=0.0, le=1.0)
-    contradiction: float = Field(ge=0.0, le=1.0)
-    start_time: float | None = None
-    end_time: float | None = None
-    observations: list[str] = Field(default_factory=list)
-    verified_event_ids: list[str] = Field(default_factory=list)
-    verified_relation_ids: list[str] = Field(default_factory=list)
-    entity_consistency: float = Field(default=0.0, ge=0.0, le=1.0)
-    temporal_consistency: float = Field(default=0.0, ge=0.0, le=1.0)
-    action_completeness: float = Field(default=0.0, ge=0.0, le=1.0)
-    uncertainty: float = Field(default=0.5, ge=0.0, le=1.0)
+class EventWorld(BaseModel):
+    """One plausible global event trajectory anchored by the CQHG query event."""
+
+    id: str
+    preconditions: list[str] = Field(default_factory=list)
+    query_anchor_event_ids: list[str] = Field(default_factory=list)
+    consequences: list[str] = Field(default_factory=list)
+    prior: float = Field(gt=0.0, le=1.0)
     rationale: str = ""
 
+
+class EventWorldSet(BaseModel):
+    query: str
+    worlds: list[EventWorld] = Field(min_length=1)
+
     @model_validator(mode="after")
-    def validate_interval(self) -> "EvidenceResult":
-        if self.start_time is not None and self.end_time is not None and self.end_time < self.start_time:
-            raise ValueError("end_time must be >= start_time")
+    def validate_worlds(self) -> "EventWorldSet":
+        world_ids = [world.id for world in self.worlds]
+        if len(world_ids) != len(set(world_ids)):
+            raise ValueError("Event world ids must be unique")
+        return self
+
+
+class WorldEvidence(BaseModel):
+    """Coarse visual evidence for one imagined event world."""
+
+    world_id: str
+    support: float = Field(ge=0.0, le=1.0)
+    contradiction: float = Field(ge=0.0, le=1.0)
+    uncertainty: float = Field(default=0.5, ge=0.0, le=1.0)
+    observations: list[str] = Field(default_factory=list)
+
+
+class WorldEvidenceBundle(BaseModel):
+    candidate_video_id: str
+    evidence: list[WorldEvidence] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_evidence_ids(self) -> "WorldEvidenceBundle":
+        ids = [item.world_id for item in self.evidence]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Each world may appear at most once in an evidence bundle")
         return self
