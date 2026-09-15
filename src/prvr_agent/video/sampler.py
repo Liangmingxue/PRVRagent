@@ -77,6 +77,34 @@ def build_overlapping_windows(
     return windows
 
 
+def uniform_bin_center_indices(start_frame: int, end_frame: int, count: int) -> list[int]:
+    """Choose one frame near the center of each equal temporal bin.
+
+    Endpoint-based linspace wastes samples on chunk boundaries and leaves wider
+    blind intervals in the interior. Bin centers minimize the maximum distance
+    from an arbitrary time inside the chunk to its nearest sampled location.
+    """
+
+    if start_frame < 0 or end_frame < start_frame:
+        raise ValueError("invalid frame range")
+    if count <= 0:
+        raise ValueError("count must be positive")
+    available = end_frame - start_frame + 1
+    count = min(int(count), available)
+    if count == available:
+        return list(range(start_frame, end_frame + 1))
+
+    step = available / float(count)
+    indices = [
+        min(end_frame, start_frame + int(math.floor((idx + 0.5) * step)))
+        for idx in range(count)
+    ]
+    # step >= 1 whenever count <= available, so duplicates should not occur.
+    if len(indices) != len(set(indices)):  # pragma: no cover - defensive
+        raise RuntimeError("bin-centered frame sampling produced duplicate indices")
+    return indices
+
+
 class DecordFrameSampler:
     def __init__(self, video_path: str) -> None:
         try:
@@ -107,13 +135,8 @@ class DecordFrameSampler:
             self.frame_count - 1,
             max(start_frame, int(math.floor(w.end * self.fps))),
         )
-        available = end_frame - start_frame + 1
-        count = min(int(num_frames), available)
-        if count <= 1:
-            indices = np.asarray([start_frame], dtype=np.int64)
-        else:
-            indices = np.rint(np.linspace(start_frame, end_frame, count)).astype(np.int64)
-            indices = np.unique(indices)
+        indices_list = uniform_bin_center_indices(start_frame, end_frame, int(num_frames))
+        indices = np.asarray(indices_list, dtype=np.int64)
         frames = self._vr.get_batch(indices).asnumpy()
-        timestamps = [float(i) / self.fps for i in indices.tolist()]
+        timestamps = [float(i) / self.fps for i in indices_list]
         return timestamps, [frame for frame in frames]
