@@ -96,24 +96,42 @@ def _quantile(values: Sequence[float], q: float) -> float:
     return ordered[lower] * (1.0 - alpha) + ordered[upper] * alpha
 
 
-def _robust_normalize(values: Sequence[float], *, scale_quantile: float = 0.90) -> list[float]:
-    """Normalize a non-negative per-video signal without being dominated by one outlier."""
+def _robust_normalize(
+    values: Sequence[float],
+    *,
+    baseline_quantile: float = 0.25,
+    scale_quantile: float = 0.90,
+) -> list[float]:
+    """Contrast-normalize a non-negative temporal signal per video.
+
+    A simple percentile divisor can flatten a trace whose low background is
+    nearly constant (e.g. 0.02 everywhere plus one 0.90 transition), because the
+    90th percentile may still equal the background.  We first subtract a robust
+    lower baseline and then scale the residual.  This preserves relative change
+    peaks while suppressing constant camera/noise floors.
+    """
 
     if not values:
         return []
-    if not 0.0 < scale_quantile <= 1.0:
-        raise ValueError("scale_quantile must be in (0, 1]")
+    if not 0.0 <= baseline_quantile < scale_quantile <= 1.0:
+        raise ValueError("normalization quantiles must satisfy 0 <= baseline < scale <= 1")
     raw = [max(0.0, float(value)) for value in values]
     if any(not math.isfinite(value) for value in raw):
         raise ValueError("sidekick scan contains non-finite values")
-    positive = [value for value in raw if value > 0.0]
+    if not any(value > 0.0 for value in raw):
+        return [0.0 for _ in raw]
+
+    baseline = _quantile(raw, baseline_quantile)
+    centered = [max(0.0, value - baseline) for value in raw]
+    positive = [value for value in centered if value > 0.0]
     if not positive:
         return [0.0 for _ in raw]
+
     scale = _quantile(positive, scale_quantile)
     if scale <= 1e-12:
         scale = max(positive)
     scale = max(scale, 1e-12)
-    return [max(0.0, min(1.0, value / scale)) for value in raw]
+    return [max(0.0, min(1.0, value / scale)) for value in centered]
 
 
 def semantic_scores_to_scan_points(
@@ -154,8 +172,6 @@ def _interpolate(points: Sequence[tuple[float, float]], timestamp: float) -> flo
     if timestamp >= points[-1][0]:
         return points[-1][1]
 
-    # Sidekick traces are small (hundreds of points), so a simple ordered scan is
-    # clearer and sufficiently cheap.  The fusion itself is outside the VLM path.
     for left, right in zip(points, points[1:]):
         if left[0] <= timestamp <= right[0]:
             span = right[0] - left[0]
@@ -163,7 +179,7 @@ def _interpolate(points: Sequence[tuple[float, float]], timestamp: float) -> flo
                 return max(left[1], right[1])
             alpha = (timestamp - left[0]) / span
             return left[1] * (1.0 - alpha) + right[1] * alpha
-    return points[-1][1]  # pragma: no cover - ordered bounds above should catch
+    return points[-1][1]
 
 
 def fuse_sidekick_scans(
@@ -176,11 +192,10 @@ def fuse_sidekick_scans(
 ) -> list[SidekickScanPoint]:
     """Fuse raw-pixel and semantic change into one query-agnostic temporal scan.
 
-    Each modality is robustly normalized per video, then aligned on the union of
-    their timestamps.  Fusion uses a weighted noisy-OR: a strong signal from
-    either modality can preserve a boundary candidate, while weak independent
-    evidence accumulates smoothly.  If semantic features are unavailable the
-    result exactly falls back to normalized visual change.
+    Each modality is contrast-normalized per video, then aligned on the union of
+    timestamps. Fusion uses a weighted noisy-OR so a strong signal from either
+    modality can preserve a boundary candidate. If semantic features are absent,
+    the result falls back to normalized visual change.
     """
 
     if not math.isfinite(duration) or duration <= 0:
@@ -201,14 +216,7 @@ def fuse_sidekick_scans(
         key=lambda point: point.timestamp,
     )
     if not visual and not semantic:
-        return [
-            SidekickScanPoint(
-                timestamp=0.0,
-                visual_score=0.0,
-                semantic_score=0.0,
-                fused_score=0.0,
-            )
-        ]
+        return [SidekickScanPoint(0.0, 0.0, 0.0, 0.0)]
 
     visual_norm = _robust_normalize([point.change_score for point in visual])
     semantic_norm = _robust_normalize([point.change_score for point in semantic])
@@ -224,7 +232,7 @@ def fuse_sidekick_scans(
     active_visual_weight = visual_weight if visual_series else 0.0
     active_semantic_weight = semantic_weight if semantic_series else 0.0
     total_weight = active_visual_weight + active_semantic_weight
-    if total_weight <= 0:  # e.g. caller disabled the only available modality
+    if total_weight <= 0:
         active_visual_weight = 1.0 if visual_series else 0.0
         active_semantic_weight = 1.0 if semantic_series else 0.0
         total_weight = active_visual_weight + active_semantic_weight
@@ -235,15 +243,8 @@ def fuse_sidekick_scans(
     for timestamp in timestamps:
         visual_score = _interpolate(visual_series, timestamp) if visual_series else 0.0
         semantic_score = _interpolate(semantic_series, timestamp) if semantic_series else 0.0
-
-        # Weighted noisy-OR.  Treat a zero-weight modality as multiplicative 1 to
-        # avoid the undefined 0**0 edge case when its normalized score is 1.
-        visual_survival = (
-            (1.0 - visual_score) ** visual_exp if visual_exp > 0 else 1.0
-        )
-        semantic_survival = (
-            (1.0 - semantic_score) ** semantic_exp if semantic_exp > 0 else 1.0
-        )
+        visual_survival = (1.0 - visual_score) ** visual_exp if visual_exp > 0 else 1.0
+        semantic_survival = (1.0 - semantic_score) ** semantic_exp if semantic_exp > 0 else 1.0
         fused = 1.0 - visual_survival * semantic_survival
         output.append(
             SidekickScanPoint(
@@ -281,13 +282,7 @@ def build_event_segments(
     boundary_quantile: float = 0.80,
     max_segments: int = 96,
 ) -> list[EventSegment]:
-    """Convert a dense hybrid sidekick scan into variable-length event segments.
-
-    Boundaries come from local maxima of a task-agnostic visual/semantic temporal
-    signal.  Forced splits cap the duration of quiet regions.  The sidekick only
-    proposes event structure: CQHG relevance still comes from the multimodal
-    observer, so this does not restore query-similarity or retrieval-peak logic.
-    """
+    """Convert a dense hybrid sidekick scan into variable-length event segments."""
 
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError("duration must be finite and positive")
@@ -359,9 +354,7 @@ def build_event_segments(
 
     segments: list[EventSegment] = []
     for index, (start, end) in enumerate(zip(canonical, canonical[1:])):
-        local = [
-            point for point in points if start - 1e-9 <= point.timestamp <= end + 1e-9
-        ]
+        local = [point for point in points if start - 1e-9 <= point.timestamp <= end + 1e-9]
         visual_salience = max((point.visual_score for point in local), default=0.0)
         semantic_salience = max((point.semantic_score for point in local), default=0.0)
         sidekick_salience = max((point.fused_score for point in local), default=0.0)
