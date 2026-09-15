@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -15,7 +15,7 @@ class AtomicEvent(StrictModel):
     id: str = Field(min_length=1)
     subject: str = Field(min_length=1)
     action: str = Field(min_length=1)
-    object: str | None = None
+    object: Optional[str] = None
     attributes: list[str] = Field(default_factory=list)
 
 
@@ -196,7 +196,7 @@ class WorldEvidenceBundle(StrictModel):
     verified_relation_ids: list[str] = Field(default_factory=list)
     supported_counterfactual_ids: list[str] = Field(default_factory=list)
     evidence: list[WorldEvidence] = Field(min_length=1)
-    anchor_chunk_index: int | None = Field(default=None, ge=0)
+    anchor_chunk_index: Optional[int] = Field(default=None, ge=0)
     refined_chunk_indices: list[int] = Field(default_factory=list)
     chunk_evidence: list[ChunkEvidence] = Field(default_factory=list)
 
