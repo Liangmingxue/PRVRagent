@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from .agents.hypothesis_planner import HypothesisPlanner
 from .agents.world_model import MAX_EVENT_WORLDS, EventWorldPlanner
-from .agents.world_observer import MAX_COARSE_FRAMES, WorldEvidenceBackend
+from .agents.world_observer import (
+    MAX_CHUNKS,
+    MAX_FRAMES_PER_CHUNK,
+    MAX_TOTAL_CHUNK_FRAMES,
+    WorldEvidenceBackend,
+)
 from .prospective import ProspectiveAssessment, ProspectiveConfig, fuse_prospective_score, revise_world_beliefs
 from .schemas import Candidate
 
@@ -14,14 +20,30 @@ from .schemas import Candidate
 @dataclass(frozen=True)
 class PipelineConfig:
     num_worlds: int = 3
-    coarse_frames: int = 8
+    frames_per_chunk: int = 4
+    target_chunk_seconds: float = 24.0
+    chunk_overlap: float = 0.25
+    max_chunks: int = 12
+    context_radius: int = 1
     scoring: ProspectiveConfig = ProspectiveConfig()
 
     def validate(self) -> None:
         if not 1 <= self.num_worlds <= MAX_EVENT_WORLDS:
             raise ValueError(f"num_worlds must be in [1, {MAX_EVENT_WORLDS}]")
-        if not 1 <= self.coarse_frames <= MAX_COARSE_FRAMES:
-            raise ValueError(f"coarse_frames must be in [1, {MAX_COARSE_FRAMES}]")
+        if not 1 <= self.frames_per_chunk <= MAX_FRAMES_PER_CHUNK:
+            raise ValueError(f"frames_per_chunk must be in [1, {MAX_FRAMES_PER_CHUNK}]")
+        if not math.isfinite(self.target_chunk_seconds) or self.target_chunk_seconds <= 0:
+            raise ValueError("target_chunk_seconds must be finite and positive")
+        if not math.isfinite(self.chunk_overlap) or not 0.0 <= self.chunk_overlap < 1.0:
+            raise ValueError("chunk_overlap must be in [0, 1)")
+        if not 1 <= self.max_chunks <= MAX_CHUNKS:
+            raise ValueError(f"max_chunks must be in [1, {MAX_CHUNKS}]")
+        if self.context_radius < 0:
+            raise ValueError("context_radius must be non-negative")
+        if self.max_chunks * self.frames_per_chunk > MAX_TOTAL_CHUNK_FRAMES:
+            raise ValueError(
+                f"max_chunks * frames_per_chunk must not exceed {MAX_TOTAL_CHUNK_FRAMES}"
+            )
         self.scoring.validate()
 
 
@@ -80,7 +102,11 @@ class PRVRAgentReranker:
                 worlds=worlds,
                 candidate=candidate,
                 video_path=video_path,
-                num_frames=self.cfg.coarse_frames,
+                frames_per_chunk=self.cfg.frames_per_chunk,
+                target_chunk_seconds=self.cfg.target_chunk_seconds,
+                chunk_overlap=self.cfg.chunk_overlap,
+                max_chunks=self.cfg.max_chunks,
+                context_radius=self.cfg.context_radius,
             )
             if evidence.candidate_video_id != candidate.video_id:
                 raise ValueError(
