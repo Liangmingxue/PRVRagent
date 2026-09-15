@@ -3,23 +3,24 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from .schemas import EventWorldSet, WorldEvidenceBundle
+from .schemas import EventWorldSet, QueryHypothesisGraph, WorldEvidenceBundle
 
 
 @dataclass(frozen=True)
 class ProspectiveConfig:
-    """Scoring parameters for evidence-grounded event-world revision."""
+    """Scoring parameters for CQHG evidence and event-world belief revision."""
 
-    base_weight: float = 0.75
-    world_weight: float = 0.25
+    base_weight: float = 0.60
+    graph_weight: float = 0.20
+    world_weight: float = 0.20
     support_scale: float = 2.0
     contradiction_scale: float = 2.0
     uncertainty_penalty: float = 0.15
 
     def validate(self) -> None:
-        if self.base_weight < 0 or self.world_weight < 0:
+        if self.base_weight < 0 or self.graph_weight < 0 or self.world_weight < 0:
             raise ValueError("fusion weights must be non-negative")
-        if self.base_weight + self.world_weight <= 0:
+        if self.base_weight + self.graph_weight + self.world_weight <= 0:
             raise ValueError("at least one fusion weight must be positive")
         if self.support_scale < 0 or self.contradiction_scale < 0:
             raise ValueError("belief-update scales must be non-negative")
@@ -40,6 +41,7 @@ class WorldBelief:
 @dataclass(frozen=True)
 class ProspectiveAssessment:
     beliefs: tuple[WorldBelief, ...]
+    graph_score: float
     world_score: float
 
 
@@ -50,16 +52,28 @@ def _normalized_priors(worlds: EventWorldSet) -> dict[str, float]:
     return {world.id: float(world.prior) / total for world in worlds.worlds}
 
 
+def score_cqhg_evidence(
+    graph: QueryHypothesisGraph,
+    evidence: WorldEvidenceBundle,
+    cfg: ProspectiveConfig,
+) -> float:
+    """Score hard query satisfaction separately from soft imagined-world context."""
+
+    valid_event_ids = {event.id for event in graph.atomic_events}
+    verified = valid_event_ids.intersection(evidence.verified_event_ids)
+    coverage = len(verified) / max(1, len(valid_event_ids))
+    positive = min(float(evidence.query_support), coverage)
+    negative = float(evidence.query_contradiction) + cfg.uncertainty_penalty * float(evidence.query_uncertainty)
+    return positive - negative
+
+
 def revise_world_beliefs(
+    graph: QueryHypothesisGraph,
     worlds: EventWorldSet,
     evidence: WorldEvidenceBundle,
     cfg: ProspectiveConfig | None = None,
 ) -> ProspectiveAssessment:
-    """Update event-world priors with coarse visual support/contradiction evidence.
-
-    This is a belief-revision step rather than query expansion: CQHG-anchored
-    worlds remain fixed while their posterior probabilities change per candidate.
-    """
+    """Revise possible-world priors with candidate evidence while preserving CQHG semantics."""
 
     cfg = cfg or ProspectiveConfig()
     cfg.validate()
@@ -104,9 +118,17 @@ def revise_world_beliefs(
             item.support - item.contradiction - cfg.uncertainty_penalty * item.uncertainty
         )
 
-    return ProspectiveAssessment(beliefs=tuple(beliefs), world_score=world_score)
+    return ProspectiveAssessment(
+        beliefs=tuple(beliefs),
+        graph_score=score_cqhg_evidence(graph, evidence, cfg),
+        world_score=world_score,
+    )
 
 
 def fuse_prospective_score(base_score: float, assessment: ProspectiveAssessment, cfg: ProspectiveConfig) -> float:
     cfg.validate()
-    return cfg.base_weight * float(base_score) + cfg.world_weight * float(assessment.world_score)
+    return (
+        cfg.base_weight * float(base_score)
+        + cfg.graph_weight * float(assessment.graph_score)
+        + cfg.world_weight * float(assessment.world_score)
+    )
