@@ -40,8 +40,9 @@ def test_pipeline_promotes_candidate_supported_by_cqhg_and_worlds():
     cfg = PipelineConfig(
         num_worlds=3,
         frames_per_chunk=4,
-        target_chunk_seconds=24.0,
-        max_chunks=8,
+        target_chunk_seconds=20.0,
+        max_chunks=16,
+        chunks_per_request=8,
         scoring=ProspectiveConfig(base_weight=0.5, graph_weight=0.25, world_weight=0.25),
     )
     reranker = PRVRAgentReranker(
@@ -61,9 +62,9 @@ def test_pipeline_promotes_candidate_supported_by_cqhg_and_worlds():
     assert ranked[0].world_score > ranked[1].world_score
 
 
-def test_pipeline_rejects_excessive_chunk_frame_budget():
+def test_pipeline_rejects_excessive_per_request_frame_budget():
     try:
-        PipelineConfig(frames_per_chunk=8, max_chunks=16).validate()
+        PipelineConfig(frames_per_chunk=9, chunks_per_request=8).validate()
     except ValueError as exc:
         assert "must not exceed" in str(exc)
     else:
