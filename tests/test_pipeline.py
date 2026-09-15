@@ -83,8 +83,6 @@ def test_pipeline_rejects_refinement_that_is_not_denser_than_coarse_pass():
 
 
 def test_pipeline_allows_multiple_refinements_because_each_is_isolated():
-    # Refinement requests are intentionally sent one segment at a time, so the
-    # total refinement budget is not a per-request image-budget violation.
     PipelineConfig(refinement_frames_per_chunk=16, max_refinement_chunks=5).validate()
 
 
@@ -109,3 +107,17 @@ def test_pipeline_rejects_invalid_event_sidekick_and_confirmation_settings():
         assert "confirmation_max_segments" in str(exc)
     else:
         raise AssertionError("expected oversized confirmation span to fail")
+
+
+def test_pipeline_rejects_invalid_hybrid_sidekick_weights():
+    for kwargs in (
+        {"sidekick_visual_weight": -0.1},
+        {"sidekick_semantic_weight": float("nan")},
+        {"sidekick_visual_weight": 0.0, "sidekick_semantic_weight": 0.0},
+    ):
+        try:
+            PipelineConfig(**kwargs).validate()
+        except ValueError as exc:
+            assert "sidekick" in str(exc)
+        else:
+            raise AssertionError("expected invalid hybrid sidekick weights to fail")
