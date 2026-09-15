@@ -2,31 +2,39 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-class AtomicEvent(BaseModel):
-    id: str
-    subject: str
-    action: str
+class StrictModel(BaseModel):
+    """Base schema that rejects silent field drift and non-finite values."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+
+class AtomicEvent(StrictModel):
+    id: str = Field(min_length=1)
+    subject: str = Field(min_length=1)
+    action: str = Field(min_length=1)
     object: str | None = None
     attributes: list[str] = Field(default_factory=list)
 
 
-class TemporalConstraint(BaseModel):
-    event_a: str
+class TemporalConstraint(StrictModel):
+    id: str = Field(min_length=1)
+    event_a: str = Field(min_length=1)
     relation: Literal["before", "after", "during", "overlap"]
-    event_b: str
+    event_b: str = Field(min_length=1)
 
 
-class IdentityConstraint(BaseModel):
-    event_a: str
-    event_b: str
+class IdentityConstraint(StrictModel):
+    id: str = Field(min_length=1)
+    event_a: str = Field(min_length=1)
+    event_b: str = Field(min_length=1)
     same_actor: bool = True
 
 
-class CounterfactualHypothesis(BaseModel):
-    id: str
+class CounterfactualHypothesis(StrictModel):
+    id: str = Field(min_length=1)
     type: Literal[
         "temporal_reversal",
         "identity_break",
@@ -35,55 +43,76 @@ class CounterfactualHypothesis(BaseModel):
         "wrong_action",
         "other",
     ]
-    description: str
+    description: str = Field(min_length=1)
 
 
-class QueryHypothesisGraph(BaseModel):
-    query: str
-    atomic_events: list[AtomicEvent]
+class QueryHypothesisGraph(StrictModel):
+    query: str = Field(min_length=1)
+    atomic_events: list[AtomicEvent] = Field(min_length=1)
     temporal_constraints: list[TemporalConstraint] = Field(default_factory=list)
     identity_constraints: list[IdentityConstraint] = Field(default_factory=list)
-    positive_hypothesis: str
+    positive_hypothesis: str = Field(min_length=1)
     counterfactuals: list[CounterfactualHypothesis] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_references(self) -> "QueryHypothesisGraph":
-        ids = {e.id for e in self.atomic_events}
-        if len(ids) != len(self.atomic_events):
+        event_ids = [event.id for event in self.atomic_events]
+        if len(event_ids) != len(set(event_ids)):
             raise ValueError("Atomic event ids must be unique")
+        valid_event_ids = set(event_ids)
+
+        relation_ids: list[str] = []
         for rel in self.temporal_constraints:
-            if rel.event_a not in ids or rel.event_b not in ids:
+            relation_ids.append(rel.id)
+            if rel.event_a not in valid_event_ids or rel.event_b not in valid_event_ids:
                 raise ValueError("Temporal constraints must reference existing atomic event ids")
+            if rel.event_a == rel.event_b:
+                raise ValueError("Temporal constraints cannot relate an event to itself")
         for rel in self.identity_constraints:
-            if rel.event_a not in ids or rel.event_b not in ids:
+            relation_ids.append(rel.id)
+            if rel.event_a not in valid_event_ids or rel.event_b not in valid_event_ids:
                 raise ValueError("Identity constraints must reference existing atomic event ids")
+            if rel.event_a == rel.event_b:
+                raise ValueError("Identity constraints cannot relate an event to itself")
+        if len(relation_ids) != len(set(relation_ids)):
+            raise ValueError("Temporal and identity constraint ids must be globally unique")
+
+        counterfactual_ids = [cf.id for cf in self.counterfactuals]
+        if len(counterfactual_ids) != len(set(counterfactual_ids)):
+            raise ValueError("Counterfactual hypothesis ids must be unique")
         return self
 
 
-class Candidate(BaseModel):
+class Candidate(StrictModel):
     """DreamPRVR candidate without any peak-specific state."""
 
-    video_id: str
-    video_index: int
+    video_id: str = Field(min_length=1)
+    video_index: int = Field(ge=0)
     base_score: float
     clip_score: float
     frame_score: float
-    metadata: dict = Field(default_factory=dict)
+    metadata: dict[str, object] = Field(default_factory=dict)
 
 
-class EventWorld(BaseModel):
+class EventWorld(StrictModel):
     """One plausible global event trajectory anchored by the CQHG query event."""
 
-    id: str
+    id: str = Field(min_length=1)
     preconditions: list[str] = Field(default_factory=list)
-    query_anchor_event_ids: list[str] = Field(default_factory=list)
+    query_anchor_event_ids: list[str] = Field(min_length=1)
     consequences: list[str] = Field(default_factory=list)
     prior: float = Field(gt=0.0, le=1.0)
     rationale: str = ""
 
+    @model_validator(mode="after")
+    def validate_anchor_ids(self) -> "EventWorld":
+        if len(self.query_anchor_event_ids) != len(set(self.query_anchor_event_ids)):
+            raise ValueError("Each CQHG anchor event id must appear exactly once in an event world")
+        return self
 
-class EventWorldSet(BaseModel):
-    query: str
+
+class EventWorldSet(StrictModel):
+    query: str = Field(min_length=1)
     worlds: list[EventWorld] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -94,17 +123,17 @@ class EventWorldSet(BaseModel):
         return self
 
 
-class WorldEvidence(BaseModel):
+class WorldEvidence(StrictModel):
     """Coarse visual evidence for one imagined event world."""
 
-    world_id: str
+    world_id: str = Field(min_length=1)
     support: float = Field(ge=0.0, le=1.0)
     contradiction: float = Field(ge=0.0, le=1.0)
     uncertainty: float = Field(default=0.5, ge=0.0, le=1.0)
     observations: list[str] = Field(default_factory=list)
 
 
-class WorldEvidenceBundle(BaseModel):
+class WorldEvidenceBundle(StrictModel):
     """One coarse candidate observation serving both CQHG and APEI.
 
     `query_support` measures evidence that the hard CQHG positive hypothesis is
@@ -112,17 +141,25 @@ class WorldEvidenceBundle(BaseModel):
     counterfactual/near-miss. The per-world evidence is soft prospective context.
     """
 
-    candidate_video_id: str
+    candidate_video_id: str = Field(min_length=1)
     query_support: float = Field(ge=0.0, le=1.0)
     query_contradiction: float = Field(ge=0.0, le=1.0)
     query_uncertainty: float = Field(default=0.5, ge=0.0, le=1.0)
     verified_event_ids: list[str] = Field(default_factory=list)
+    verified_relation_ids: list[str] = Field(default_factory=list)
     supported_counterfactual_ids: list[str] = Field(default_factory=list)
     evidence: list[WorldEvidence] = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_evidence_ids(self) -> "WorldEvidenceBundle":
-        ids = [item.world_id for item in self.evidence]
-        if len(ids) != len(set(ids)):
+        world_ids = [item.world_id for item in self.evidence]
+        if len(world_ids) != len(set(world_ids)):
             raise ValueError("Each world may appear at most once in an evidence bundle")
+        for name, ids in (
+            ("verified_event_ids", self.verified_event_ids),
+            ("verified_relation_ids", self.verified_relation_ids),
+            ("supported_counterfactual_ids", self.supported_counterfactual_ids),
+        ):
+            if len(ids) != len(set(ids)):
+                raise ValueError(f"{name} must not contain duplicate ids")
         return self
