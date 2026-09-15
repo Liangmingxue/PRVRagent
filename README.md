@@ -5,7 +5,7 @@ Research scaffold for **Partially Relevant Video Retrieval (PRVR)** built around
 1. **Counterfactual Query Hypothesis Graph (CQHG)**: represent what must be true for the query to be fully satisfied, together with structured semantic near-misses.
 2. **Abductive Prospective Event World Modeling (APEI)**: before fine-grained alignment, imagine several plausible event worlds in which the query could occur, then revise their probabilities using coarse evidence from each candidate video.
 
-The previous peak-seeded / local-spurious-response contribution has been removed from the agent design.
+The previous peak-seeded / local-spurious-response contribution has been removed from the agent design. Counterfactual near-miss reasoning is retained because it is part of CQHG, not a separate third contribution.
 
 ## Current pipeline
 
@@ -14,10 +14,11 @@ query
   -> Counterfactual Query Hypothesis Graph
   -> K CQHG-anchored possible event worlds
   -> DreamPRVR top-K candidates
-  -> coarse whole-video observation for each candidate
-  -> support / contradiction for every imagined world
-  -> posterior belief revision
-  -> prospective evidence-aware reranking
+  -> one coarse whole-video observation per candidate
+       -> hard CQHG satisfaction / counterfactual evidence
+       -> soft support / contradiction for each imagined world
+  -> event-world posterior belief revision
+  -> CQHG + prospective evidence-aware reranking
 ```
 
 The key distinction is:
@@ -37,7 +38,9 @@ APEI: If it is true, how could the event world unfold?
 - a positive hypothesis;
 - counterfactual near-misses such as partial event, temporal reversal, identity break, wrong object, and wrong action.
 
-CQHG is the hard semantic anchor for the rest of the pipeline. Prospective imagination is not allowed to modify or replace CQHG atomic events.
+CQHG is the hard semantic anchor. For each candidate, the visual observer reports `query_support`, `query_contradiction`, and the actually observed atomic-event ids. The CQHG score therefore rewards complete event coverage and penalizes semantic near-misses rather than relying on similarity alone.
+
+Prospective imagination is not allowed to modify or replace CQHG atomic events.
 
 ## Innovation 2: Abductive Prospective Event World Modeling
 
@@ -66,7 +69,7 @@ log posterior(H_k)
     - gamma * contradiction(H_k, V)
 ```
 
-The posterior-weighted world evidence is fused with the original DreamPRVR candidate score for reranking.
+The final score fuses three terms: the original DreamPRVR score, hard CQHG satisfaction, and posterior-weighted prospective world evidence.
 
 ## What was removed
 
@@ -85,8 +88,8 @@ DreamPRVR still uses its own internal max-similarity mechanism to produce its no
 
 - `src/prvr_agent/agents/hypothesis_planner.py`: CQHG generation.
 - `src/prvr_agent/agents/world_model.py`: abductive prospective event-world generation.
-- `src/prvr_agent/agents/world_observer.py`: coarse whole-video visual evidence for event worlds.
-- `src/prvr_agent/prospective.py`: prior normalization, posterior belief revision, and score fusion.
+- `src/prvr_agent/agents/world_observer.py`: one coarse candidate observation for CQHG evidence and event-world evidence.
+- `src/prvr_agent/prospective.py`: CQHG scoring, prior normalization, posterior belief revision, and score fusion.
 - `src/prvr_agent/pipeline.py`: end-to-end CQHG + APEI reranking.
 - `src/prvr_agent/retriever/dreamprvr_adapter.py`: non-invasive DreamPRVR top-K adapter without peak export.
 
@@ -161,15 +164,15 @@ batch = adapter.retrieve(query_feat, query_mask, top_k=20)
 candidates = batch.candidates[0]
 ```
 
-These candidates can then be passed to `PRVRAgentReranker`, which performs CQHG-conditioned prospective world modeling and candidate-specific belief revision.
+These candidates can then be passed to `PRVRAgentReranker`, which evaluates hard CQHG satisfaction and candidate-specific prospective world beliefs in one coarse visual pass.
 
 ## Research status
 
 This branch is still an MVP research scaffold. Before benchmark reporting, the main remaining work is:
 
-- validate Qwen3-VL world generation quality on real TVR / ActivityNet Captions / Charades-STA queries;
+- validate Qwen3-VL CQHG and world generation quality on real TVR / ActivityNet Captions / Charades-STA queries;
 - validate coarse-frame sampling coverage for long videos;
 - add benchmark-specific video-id -> path resolution;
-- calibrate `base_weight`, `world_weight`, support/contradiction scales on validation data only;
+- calibrate `base_weight`, `graph_weight`, `world_weight`, support/contradiction scales on validation data only;
 - add official PRVR R@K / SumR evaluation and ablations against single-caption/query-expansion baselines;
-- log generated worlds and posterior changes for qualitative analysis.
+- log CQHG evidence, generated worlds, and posterior changes for qualitative analysis.
