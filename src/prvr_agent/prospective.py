@@ -161,8 +161,11 @@ def fuse_prospective_score(base_score: float, assessment: ProspectiveAssessment,
     cfg.validate()
     if not math.isfinite(float(base_score)):
         raise ValueError("base_score must be finite")
-    return (
+    score = (
         cfg.base_weight * float(base_score)
         + cfg.graph_weight * float(assessment.graph_score)
         + cfg.world_weight * float(assessment.world_score)
     )
+    if not math.isfinite(score):
+        raise ValueError("fused prospective score is non-finite")
+    return score
