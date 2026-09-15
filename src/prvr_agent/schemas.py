@@ -128,7 +128,10 @@ class CandidateWorldObservation(StrictModel):
     query_satisfaction: float = Field(
         ge=0.0,
         le=1.0,
-        description="Evidence that the hard CQHG positive hypothesis is actually satisfied.",
+        description=(
+            "Evidence that the hard CQHG positive hypothesis is satisfied. "
+            "Use 0.5 for insufficient/neutral sparse evidence; values below 0.5 require visible contradictory/near-miss evidence."
+        ),
     )
     counterfactual_risk: float = Field(
         ge=0.0,
