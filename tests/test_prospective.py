@@ -73,6 +73,31 @@ def test_counterfactual_evidence_lowers_graph_score():
     assert bad.world_score < good.world_score
 
 
+def test_uncertainty_is_neutral_not_negative_evidence():
+    worlds = EventWorldSet(
+        query="person opens a door",
+        worlds=[EventWorld(id="H1", query_anchor_event_ids=["E1"], prior=1.0)],
+    )
+    unknown = WorldEvidenceBundle(
+        candidate_video_id="v",
+        query_support=0.0,
+        query_contradiction=0.0,
+        query_uncertainty=1.0,
+        verified_event_ids=[],
+        evidence=[
+            WorldEvidence(
+                world_id="H1",
+                support=0.0,
+                contradiction=0.0,
+                uncertainty=1.0,
+            )
+        ],
+    )
+    out = revise_world_beliefs(_graph(), worlds, unknown)
+    assert out.graph_score == 0.0
+    assert out.world_score == 0.0
+
+
 def test_temporal_relation_must_be_verified_for_complete_cqhg_support():
     graph = QueryHypothesisGraph(
         query="person closes a door then sits",
