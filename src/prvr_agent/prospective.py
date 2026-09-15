@@ -70,8 +70,9 @@ def score_cqhg_evidence(
 ) -> float:
     """Score complete CQHG satisfaction, including hard relation coverage.
 
-    Atomic-event presence alone is insufficient for a multi-event query. Temporal
-    and identity constraints must also be explicitly verified when they exist.
+    Uncertainty reduces the strength of a judgment toward zero; it is not itself
+    negative evidence. This is important in PRVR because sparse observation of a
+    long video can simply fail to see the relevant local moment.
     """
 
     valid_event_ids = {event.id for event in graph.atomic_events}
@@ -88,8 +89,9 @@ def score_cqhg_evidence(
         relation_coverage = 1.0
 
     positive = min(float(evidence.query_support), event_coverage, relation_coverage)
-    negative = float(evidence.query_contradiction) + cfg.uncertainty_penalty * float(evidence.query_uncertainty)
-    return positive - negative
+    contradiction = float(evidence.query_contradiction)
+    confidence = max(0.0, 1.0 - float(evidence.query_uncertainty))
+    return confidence * (positive - contradiction)
 
 
 def revise_world_beliefs(
@@ -143,7 +145,11 @@ def revise_world_beliefs(
                 uncertainty=item.uncertainty,
             )
         )
-        local_score = item.support - item.contradiction - cfg.uncertainty_penalty * item.uncertainty
+        # Uncertain observation should reduce influence rather than behave like a
+        # contradiction. This preserves the "absence of evidence is not evidence
+        # of absence" rule for imagined preconditions/consequences.
+        evidence_confidence = max(0.0, 1.0 - item.uncertainty)
+        local_score = evidence_confidence * (item.support - item.contradiction)
         # Soft imagined context may help when the hard query is unresolved, but it
         # must not rescue a candidate that has explicit CQHG contradiction evidence.
         if local_score > 0:
