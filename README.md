@@ -40,7 +40,7 @@ APEI: If it is true, how could the event world unfold?
 
 CQHG is the hard semantic anchor. For each candidate, the visual observer reports `query_support`, `query_contradiction`, actually observed atomic-event ids, verified temporal/identity relation ids, and supported counterfactual ids. A multi-event query therefore cannot receive full CQHG credit from event presence alone when its required temporal or identity relation is unverified.
 
-Prospective imagination is not allowed to modify or replace CQHG atomic events.
+Prospective imagination is not allowed to modify or replace CQHG atomic events **or** its temporal/identity relations.
 
 ## Innovation 2: Abductive Prospective Event World Modeling
 
@@ -50,7 +50,7 @@ Prospective imagination is not allowed to modify or replace CQHG atomic events.
 preconditions -> immutable CQHG query event -> consequences
 ```
 
-Each world contains a prior probability and every CQHG event id exactly once as a hard anchor. The implementation rejects generated worlds that drop, add, duplicate, or rename CQHG atomic-event ids.
+Each world contains a prior probability, every CQHG atomic-event id exactly once, and every CQHG temporal/identity relation id exactly once as hard anchors. The implementation rejects generated worlds that drop, add, duplicate, rename, or reverse these CQHG anchors.
 
 `OpenAIWorldEvidenceBackend` then samples coarse frames across the **whole candidate video** and estimates, for each imagined world:
 
@@ -58,7 +58,7 @@ Each world contains a prior probability and every CQHG event id exactly once as 
 - visual contradiction;
 - uncertainty.
 
-The imagined preconditions and consequences are soft context. Their absence is not treated as contradiction; only visible conflicting evidence should suppress a world. Positive soft-world evidence is also gated by explicit CQHG contradiction so an imagined context cannot rescue a candidate that visibly violates the hard query semantics.
+The imagined preconditions and consequences are soft context. Their absence is not treated as contradiction; only visible conflicting evidence should suppress a world. Uncertainty reduces the influence of an observation toward zero rather than acting as negative evidence. Positive soft-world evidence is also gated by explicit CQHG contradiction so an imagined context cannot rescue a candidate that visibly violates the hard query semantics.
 
 Posterior beliefs follow the evidence-weighted form:
 
@@ -108,6 +108,8 @@ For DreamPRVR, raw-video observation, and the local multimodal model:
 ```bash
 pip install -e '.[all]'
 ```
+
+The package accepts Python 3.9+ and PyTorch 2.0+ so it can be installed alongside the public DreamPRVR environments; the Qwen3-VL/vLLM server can remain in its own separate environment and is accessed over the OpenAI-compatible endpoint.
 
 ## Local Qwen3-VL / vLLM
 
