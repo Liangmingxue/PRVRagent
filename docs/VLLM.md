@@ -20,6 +20,8 @@ env -u PYTHONHOME -u PYTHONPATH \
   --gpu-memory-utilization 0.9
 ```
 
+`--trust-remote-code` permits model-provided Python code to execute. Keep it only for model sources you explicitly trust; the command above assumes the local Qwen3-VL model directory is trusted.
+
 PRVR-Agent does not require tool calling for the current CQHG planner, prospective world planner, or world-observer path, so `--tool-call-parser hermes` is optional. If the server must be reachable from other machines, protect it at the network/reverse-proxy layer rather than exposing the unauthenticated development configuration directly.
 
 Configure the client:
