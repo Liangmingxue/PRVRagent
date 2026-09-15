@@ -112,7 +112,14 @@ def test_temporal_relation_must_be_verified_for_complete_cqhg_support():
     )
     worlds = EventWorldSet(
         query=graph.query,
-        worlds=[EventWorld(id="H1", query_anchor_event_ids=["E1", "E2"], prior=1.0)],
+        worlds=[
+            EventWorld(
+                id="H1",
+                query_anchor_event_ids=["E1", "E2"],
+                query_anchor_relation_ids=["T1"],
+                prior=1.0,
+            )
+        ],
     )
     missing_relation = WorldEvidenceBundle(
         candidate_video_id="v",
