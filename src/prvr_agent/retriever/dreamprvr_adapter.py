@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from prvr_agent.schemas import Candidate
+from prvr_agent.video.kernel_temporal import (
+    change_points_to_fractions,
+    kernel_temporal_segment,
+)
 
 
 SEMANTIC_SIDEKICK_METADATA_KEY = "apei_semantic_sidekick"
@@ -23,9 +27,11 @@ class DreamPRVRAdapter:
     argmax peak is exported.
 
     When the upstream ``video_mask`` is available, the adapter additionally
-    exports a *query-agnostic* temporal semantic-change trace derived from the
-    already-computed DreamPRVR frame representations. APEI uses this trace only
-    as a cheap sidekick for event-aware observation, never as retrieval evidence.
+    exports query-agnostic semantic structure from the already-computed DreamPRVR
+    frame representations.  The metadata contains both a lightweight local
+    novelty curve and globally optimized kernel-temporal boundaries.  APEI uses
+    them only to decide where to observe more carefully; they never become
+    retrieval evidence or CQHG support by themselves.
     """
 
     def __init__(
@@ -37,6 +43,9 @@ class DreamPRVRAdapter:
         clip_scale_weight: float = 0.5,
         frame_scale_weight: float = 0.5,
         semantic_sidekick_radius: int = 2,
+        semantic_kts_max_change_points: int = 8,
+        semantic_kts_penalty: float = 0.6,
+        semantic_kts_min_segment_bins: int = 2,
     ) -> None:
         required = {"video_proposal_feat", "video_feat"}
         missing = sorted(required.difference(context_info))
@@ -52,6 +61,9 @@ class DreamPRVRAdapter:
         self.clip_scale_weight = float(clip_scale_weight)
         self.frame_scale_weight = float(frame_scale_weight)
         self.semantic_sidekick_radius = int(semantic_sidekick_radius)
+        self.semantic_kts_max_change_points = int(semantic_kts_max_change_points)
+        self.semantic_kts_penalty = float(semantic_kts_penalty)
+        self.semantic_kts_min_segment_bins = int(semantic_kts_min_segment_bins)
         self._semantic_sidekick_cache: dict[int, dict[str, object]] = {}
 
         if not self.video_ids:
@@ -64,6 +76,12 @@ class DreamPRVRAdapter:
             raise ValueError("at least one retrieval fusion weight must be positive")
         if self.semantic_sidekick_radius <= 0:
             raise ValueError("semantic_sidekick_radius must be positive")
+        if self.semantic_kts_max_change_points < 0:
+            raise ValueError("semantic_kts_max_change_points must be non-negative")
+        if not math.isfinite(self.semantic_kts_penalty) or self.semantic_kts_penalty < 0:
+            raise ValueError("semantic_kts_penalty must be finite and non-negative")
+        if self.semantic_kts_min_segment_bins <= 0:
+            raise ValueError("semantic_kts_min_segment_bins must be positive")
 
         clip_features = context_info["video_proposal_feat"]
         frame_features = context_info["video_feat"]
@@ -116,11 +134,12 @@ class DreamPRVRAdapter:
 
     @staticmethod
     def _semantic_change_curve(frame_features, *, radius: int = 2) -> list[float]:
-        """Return a query-agnostic semantic novelty curve for ordered frame features.
+        """Return a query-agnostic local semantic novelty curve.
 
         Each boundary combines adjacent cosine change with a short left-vs-right
-        context change. This is a lightweight KTS-inspired feature-change signal,
-        not an implementation of the full KTS dynamic-programming objective.
+        context change.  The global KTS dynamic program is computed separately;
+        keeping the local curve preserves sharp transitions that a global model
+        selection penalty may intentionally omit.
         """
 
         try:
@@ -161,7 +180,7 @@ class DreamPRVRAdapter:
         return [float(value) for value in scores.detach().cpu().tolist()]
 
     def _semantic_sidekick_metadata(self, video_index: int) -> dict[str, object] | None:
-        """Build/cache a semantic sidekick trace for one candidate video."""
+        """Build/cache local novelty plus global kernel-temporal structure."""
 
         if video_index in self._semantic_sidekick_cache:
             return dict(self._semantic_sidekick_cache[video_index])
@@ -194,11 +213,28 @@ class DreamPRVRAdapter:
         valid_features = frame_features[:valid_length]
 
         scores = self._semantic_change_curve(valid_features, radius=self.semantic_sidekick_radius)
+
+        # KTS is computed from the same query-agnostic ordered representations.
+        # Only normalized boundary fractions are exported, keeping candidate
+        # metadata compact and avoiding a second copy of the feature tensor.
+        effective_min_bins = min(self.semantic_kts_min_segment_bins, valid_length)
+        kts = kernel_temporal_segment(
+            valid_features.detach().float().cpu().numpy(),
+            max_change_points=self.semantic_kts_max_change_points,
+            penalty_scale=self.semantic_kts_penalty,
+            min_segment_length=effective_min_bins,
+        )
+        kts_fractions = change_points_to_fractions(kts.change_points, valid_length)
+
         payload: dict[str, object] = {
             "source": "dreamprvr_encoded_frame_feat",
             "valid_length": valid_length,
             "context_radius": self.semantic_sidekick_radius,
             "change_scores": scores,
+            "kernel_boundary_fractions": kts_fractions,
+            "kernel_selected_change_points": kts.selected_change_points,
+            "kernel_penalty_scale": self.semantic_kts_penalty,
+            "kernel_min_segment_bins": effective_min_bins,
         }
         self._semantic_sidekick_cache[video_index] = payload
         return dict(payload)
