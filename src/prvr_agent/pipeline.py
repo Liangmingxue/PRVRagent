@@ -43,10 +43,14 @@ class PipelineConfig:
     event_min_seconds: float = 4.0
     event_boundary_quantile: float = 0.80
 
-    # Selective dense re-observation of ambiguous/high-change event segments.
+    # Bounded coarse-to-fine observation.  A zero default threshold deliberately
+    # keeps every coarse event segment eligible for the small refinement budget;
+    # the selector then balances evidence priority and temporal diversity.  This
+    # avoids a hard pre-filter failure in which an overconfident coarse pass could
+    # suppress all denser observations.  ``max_refinement_chunks`` still caps cost.
     refinement_frames_per_chunk: int = 12
     max_refinement_chunks: int = 3
-    refinement_threshold: float = 0.30
+    refinement_threshold: float = 0.0
 
     # Clean single-span confirmation that produces final hard CQHG evidence.
     confirmation_frames: int = 16
