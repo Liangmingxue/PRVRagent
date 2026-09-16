@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from prvr_agent.video.event_segments import (
@@ -5,7 +7,15 @@ from prvr_agent.video.event_segments import (
     build_event_segments,
     semantic_scores_to_scan_points,
 )
-from prvr_agent.video.sampler import TimeWindow, build_overlapping_windows, uniform_bin_center_indices
+from prvr_agent.video.sampler import (
+    FRAME_DIRECTORY_FPS_ENV,
+    DecordFrameSampler,
+    FrameDirectorySampler,
+    TimeWindow,
+    build_overlapping_windows,
+    open_temporal_visual_source,
+    uniform_bin_center_indices,
+)
 
 
 def test_time_window_rejects_invalid_bounds():
@@ -57,6 +67,42 @@ def test_bin_center_sampling_avoids_wasting_sparse_samples_on_boundaries():
 
 def test_bin_center_sampling_returns_every_frame_when_budget_is_dense():
     assert uniform_bin_center_indices(5, 8, 10) == [5, 6, 7, 8]
+
+
+def test_frame_directory_sampler_naturally_orders_frames_and_uses_explicit_fps(tmp_path: Path):
+    frame_dir = tmp_path / "clip_01"
+    frame_dir.mkdir()
+    for name in ["10.jpg", "2.jpg", "1.jpg"]:
+        (frame_dir / name).write_bytes(b"placeholder")
+
+    source = FrameDirectorySampler(frame_dir, fps=3.0)
+    assert [path.name for path in source.frame_paths] == ["1.jpg", "2.jpg", "10.jpg"]
+    assert source.frame_count == 3
+    assert source.fps == 3.0
+    assert source.duration == pytest.approx(1.0)
+
+
+def test_frame_directory_source_requires_explicit_dataset_fps(tmp_path: Path, monkeypatch):
+    frame_dir = tmp_path / "clip_01"
+    frame_dir.mkdir()
+    (frame_dir / "0001.jpg").write_bytes(b"placeholder")
+    monkeypatch.delenv(FRAME_DIRECTORY_FPS_ENV, raising=False)
+
+    with pytest.raises(ValueError, match="frame_directory_fps"):
+        open_temporal_visual_source(frame_dir)
+
+
+def test_existing_observer_sampler_dispatches_frame_directory_via_env(tmp_path: Path, monkeypatch):
+    frame_dir = tmp_path / "clip_01"
+    frame_dir.mkdir()
+    for idx in range(3):
+        (frame_dir / f"{idx:04d}.jpg").write_bytes(b"placeholder")
+    monkeypatch.setenv(FRAME_DIRECTORY_FPS_ENV, "3")
+
+    source = DecordFrameSampler(frame_dir)
+    assert isinstance(source, FrameDirectorySampler)
+    assert source.fps == 3.0
+    assert source.frame_count == 3
 
 
 def test_semantic_change_scores_map_to_uniform_bin_boundaries():
