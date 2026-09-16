@@ -28,8 +28,8 @@ class DreamPRVRAdapter:
 
     When the upstream ``video_mask`` is available, the adapter additionally
     exports query-agnostic semantic structure from the already-computed DreamPRVR
-    frame representations.  The metadata contains both a lightweight local
-    novelty curve and globally optimized kernel-temporal boundaries.  APEI uses
+    frame representations. The metadata contains both a lightweight local
+    novelty curve and globally optimized kernel-temporal boundaries. APEI uses
     them only to decide where to observe more carefully; they never become
     retrieval evidence or CQHG support by themselves.
     """
@@ -137,7 +137,7 @@ class DreamPRVRAdapter:
         """Return a query-agnostic local semantic novelty curve.
 
         Each boundary combines adjacent cosine change with a short left-vs-right
-        context change.  The global KTS dynamic program is computed separately;
+        context change. The global KTS dynamic program is computed separately;
         keeping the local curve preserves sharp transitions that a global model
         selection penalty may intentionally omit.
         """
@@ -212,7 +212,10 @@ class DreamPRVRAdapter:
             raise ValueError("DreamPRVR video_mask valid positions must form one contiguous prefix")
         valid_features = frame_features[:valid_length]
 
-        scores = self._semantic_change_curve(valid_features, radius=self.semantic_sidekick_radius)
+        local_scores = self._semantic_change_curve(
+            valid_features,
+            radius=self.semantic_sidekick_radius,
+        )
 
         # KTS is computed from the same query-agnostic ordered representations.
         # Only normalized boundary fractions are exported, keeping candidate
@@ -226,11 +229,21 @@ class DreamPRVRAdapter:
         )
         kts_fractions = change_points_to_fractions(kts.change_points, valid_length)
 
+        # The existing observer consumes a one-dimensional semantic change trace.
+        # Promote globally selected KTS boundaries into that trace with the maximum
+        # cosine-distance scale while keeping the raw local curve for ablations.
+        # This lets the global DP affect event proposals without exporting features
+        # or reintroducing query-conditioned retrieval peaks.
+        combined_scores = list(local_scores)
+        for boundary in kts.change_points:
+            combined_scores[int(boundary)] = max(combined_scores[int(boundary)], 2.0)
+
         payload: dict[str, object] = {
             "source": "dreamprvr_encoded_frame_feat",
             "valid_length": valid_length,
             "context_radius": self.semantic_sidekick_radius,
-            "change_scores": scores,
+            "change_scores": combined_scores,
+            "local_change_scores": local_scores,
             "kernel_boundary_fractions": kts_fractions,
             "kernel_selected_change_points": kts.selected_change_points,
             "kernel_penalty_scale": self.semantic_kts_penalty,
