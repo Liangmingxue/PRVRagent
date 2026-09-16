@@ -83,7 +83,7 @@ rather than `c / (N - 1) * video_duration`.
 
 **3. Coverage-safe dense re-observation.** Every event segment first receives a low-cost VLM pass. A small bounded number of segments are then re-observed with more frames according to a priority combining hybrid sidekick salience, partial CQHG coverage, unresolved relations, Qwen uncertainty, support/contradiction conflict, and prospective-world hints. Temporal diversity prevents the budget from collapsing onto one neighborhood.
 
-The default refinement threshold is now `0.0`: all coarse event segments remain eligible for the bounded refinement budget (`max_refinement_chunks=3` by default). This is intentional. A hard pre-filter can terminate refinement when the sparse coarse pass is confidently wrong; keeping all coarse segments eligible lets relevance priority and temporal coverage decide how to spend the fixed refinement budget. A positive threshold remains available as an ablation/configuration option.
+The pipeline default refinement threshold is `0.0`: all coarse event segments remain eligible for the bounded refinement budget (`max_refinement_chunks=3` by default). This is intentional. A hard pre-filter can terminate refinement when the sparse coarse pass is confidently wrong; keeping all coarse segments eligible lets relevance priority and temporal coverage decide how to spend the fixed refinement budget. A positive threshold remains available as an ablation/configuration option.
 
 **4. Isolated contiguous-span confirmation.** Adjacent partial event segments may jointly propose one short contiguous span, but their evidence is not directly unioned into the final CQHG score. The proposed span is sent to a clean Qwen request that contains only that span. Final hard event/relation evidence must be re-observed from scratch in this isolated request. This prevents cross-attention between distant segments in a batched coarse request from becoming final evidence, while still allowing a true event that straddles one adaptive boundary to be confirmed.
 
@@ -99,20 +99,57 @@ log posterior(H_k)
     - uncertainty penalty
 ```
 
-The final score fuses three terms: the original DreamPRVR score, hard CQHG satisfaction, and posterior-weighted prospective world evidence.
+The final candidate score fuses the original DreamPRVR score, hard CQHG satisfaction, and posterior-weighted prospective-world evidence. That fused score is used to **order candidates inside the DreamPRVR shortlist**; benchmark evaluation does not compare it numerically against untouched full-collection DreamPRVR scores.
 
 ## Why the observation policy is structured this way
 
 The implementation follows published long-video findings rather than treating sparse Qwen uncertainty as a sufficient selector:
 
 - **DeCafNet (CVPR 2025)** motivates a cheap dense sidekick followed by expensive expert processing only where needed.
-- **Kernel Temporal Segmentation as an Adaptive Tokenizer (ICCVW 2023)** motivates task-agnostic feature-space temporal segmentation into variable-length semantically consistent units instead of fixed uniform chunks. PRVR-Agent now includes an independent KTS-style global dynamic-programming segmenter plus a local semantic novelty signal.
+- **Kernel Temporal Segmentation as an Adaptive Tokenizer (ICCVW 2023)** motivates task-agnostic feature-space temporal segmentation into variable-length semantically consistent units instead of fixed uniform chunks. PRVR-Agent includes an independent KTS-style global dynamic-programming segmenter plus a local semantic novelty signal.
 - **KTV (AAAI 2026)** supports question-agnostic feature-based preselection to avoid coupling the prefilter to query similarity.
 - **AKS (CVPR 2025)** motivates balancing informative evidence with temporal coverage under a fixed observation budget.
-- **FOCUS (ICLR 2026)** motivates coarse exploration across the full temporal search space before fine exploitation; in particular, it highlights that hard pre-filtering can discard the most informative moments.
+- **FOCUS (ICLR 2026)** motivates coarse exploration across the full temporal search space before fine exploitation; in particular, it highlights that hard pre-filtering can discard informative moments.
 - **From Frames to Clips (2025)** motivates keeping short temporally coherent spans instead of reasoning only from isolated keyframes.
 
 These references motivate the observation policy only. CQHG and prospective event-world belief revision remain the actual PRVR contributions.
+
+## Benchmark-safe reranking and metrics
+
+DreamPRVR evaluates text-to-video retrieval with `R@1`, `R@5`, `R@10`, `R@100`, and
+
+```text
+Rsum = R@1 + R@5 + R@10 + R@100.
+```
+
+`src/prvr_agent/evaluation/prvr_metrics.py` reproduces those semantics, including query ids of the form `video_id#...` and best-ground-truth-video rank when a query has more than one valid video.
+
+APEI is intentionally applied only to a DreamPRVR Top-K shortlist because multimodal candidate observation is expensive. A fused APEI score and a raw DreamPRVR similarity are not guaranteed to share a numerical scale. Therefore `evaluation/rerank.py` uses **rank-slot reassignment**:
+
+1. DreamPRVR supplies the original full score row and Top-K shortlist.
+2. APEI determines the ordering *inside* that shortlist.
+3. The original Top-K DreamPRVR score values are reused as ordered rank slots.
+4. Scores outside Top-K are unchanged.
+
+This makes evaluation a true Top-K reranking experiment and prevents an arbitrary transformed-score scale from promoting or demoting the complete shortlist relative to untouched videos. If a relevant video is outside DreamPRVR Top-K, APEI cannot rescue it; `K` is therefore an explicit experimental variable and should be ablated.
+
+Raw-video lookup is handled by `IndexedVideoPathResolver`, which recursively indexes one or more dataset roots by filename stem and rejects duplicate stems instead of silently resolving an ambiguous benchmark id.
+
+Check that raw videos are available:
+
+```bash
+prvr-agent index-videos /path/to/raw_videos \
+  --expected-video-ids /path/to/video_ids.json
+```
+
+Evaluate a full score matrix:
+
+```bash
+prvr-agent eval-metrics \
+  --scores /path/to/scores.npy \
+  --video-ids /path/to/video_ids.json \
+  --query-ids /path/to/query_ids.json
+```
 
 ## What was removed
 
@@ -137,7 +174,10 @@ DreamPRVR still uses its own internal max-similarity mechanism to produce normal
 - `src/prvr_agent/video/sampler.py`: raw-video frame sampling and dense low-resolution visual-change scan.
 - `src/prvr_agent/prospective.py`: CQHG scoring, prior normalization, posterior belief revision, and score fusion.
 - `src/prvr_agent/pipeline.py`: end-to-end CQHG + APEI reranking.
-- `src/prvr_agent/retriever/dreamprvr_adapter.py`: DreamPRVR top-K adapter plus query-agnostic local/global semantic sidekick structure; no peak export.
+- `src/prvr_agent/retriever/dreamprvr_adapter.py`: DreamPRVR Top-K adapter plus query-agnostic local/global semantic sidekick structure; no peak export.
+- `src/prvr_agent/evaluation/prvr_metrics.py`: DreamPRVR-compatible `R@1/5/10/100` and `Rsum`.
+- `src/prvr_agent/evaluation/rerank.py`: scale-safe Top-K rank-slot reranking.
+- `src/prvr_agent/evaluation/video_paths.py`: indexed raw-video id resolution.
 
 ## Installation
 
@@ -223,7 +263,8 @@ This branch is still an MVP research scaffold. Before benchmark reporting, the m
 - calibrate visual-vs-semantic sidekick fusion, KTS penalty / maximum change points, scan rate, event boundary quantile, segment duration, coarse/refinement/confirmation frame budgets, and compute/recall trade-offs on validation data;
 - ablate `visual-only`, `local-semantic`, `KTS-global`, `hybrid`, fixed-chunk, and whole-video uniform observation policies;
 - ablate refinement threshold `0.0` against positive-threshold pre-filtering to measure the accuracy/compute effect of coverage-safe refinement;
-- add benchmark-specific video-id -> path resolution;
+- ablate DreamPRVR shortlist size `K` because APEI cannot recover a relevant video outside the shortlist;
 - calibrate `base_weight`, `graph_weight`, `world_weight`, support/contradiction scales on validation data only;
-- add official PRVR R@K / SumR evaluation and ablations against single-caption/query-expansion baselines;
+- connect the existing metric/rank-slot/video-resolution utilities into one dataset-specific end-to-end benchmark command after the local raw-video locations and DreamPRVR checkpoint layout are known;
+- add ablations against single-caption/query-expansion baselines;
 - log segment boundaries, visual/semantic/fused sidekick salience, refinement choices, confirmation span, CQHG event timestamps, generated worlds, and posterior changes for qualitative analysis.
