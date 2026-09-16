@@ -106,8 +106,8 @@ def _robust_normalize(
 
     A simple percentile divisor can flatten a trace whose low background is
     nearly constant (e.g. 0.02 everywhere plus one 0.90 transition), because the
-    90th percentile may still equal the background.  We first subtract a robust
-    lower baseline and then scale the residual.  This preserves relative change
+    90th percentile may still equal the background. We first subtract a robust
+    lower baseline and then scale the residual. This preserves relative change
     peaks while suppressing constant camera/noise floors.
     """
 
@@ -138,11 +138,13 @@ def semantic_scores_to_scan_points(
     change_scores: Sequence[float],
     duration: float,
 ) -> list[SemanticScanPoint]:
-    """Map uniformly ordered DreamPRVR semantic positions onto video time.
+    """Map DreamPRVR semantic *boundary* scores onto physical video time.
 
-    DreamPRVR's public data provider uniformly samples/averages the frame-feature
-    sequence before context encoding, so relative feature position is a defensible
-    approximate timestamp when exact extractor timestamps are unavailable.
+    DreamPRVR uniformly samples/averages an ordered frame-feature sequence into N
+    semantic bins. ``change_scores[i]`` for i>0 compares the region before bin i
+    with bin i, so its physical boundary is i/N of the video duration. Mapping it
+    as i/(N-1) would incorrectly treat semantic bins as endpoint samples and shift
+    every interior boundary later in time.
     """
 
     if not math.isfinite(duration) or duration <= 0:
@@ -152,9 +154,8 @@ def semantic_scores_to_scan_points(
         raise ValueError("semantic change scores must be finite and non-negative")
     if not scores:
         return []
-    if len(scores) == 1:
-        return [SemanticScanPoint(timestamp=0.0, change_score=scores[0])]
-    denominator = float(len(scores) - 1)
+
+    denominator = float(len(scores))
     return [
         SemanticScanPoint(
             timestamp=float(duration) * idx / denominator,
@@ -273,16 +274,50 @@ def _as_sidekick_points(
     raise TypeError("scan_points must be uniformly VisualScanPoint or SidekickScanPoint")
 
 
+def _preferred_boundaries(
+    duration: float,
+    boundaries: Sequence[float],
+    *,
+    min_segment_seconds: float,
+) -> list[float]:
+    """Validate and sparsify global semantic boundaries before local fusion."""
+
+    raw: list[float] = []
+    for value in boundaries:
+        boundary = float(value)
+        if not math.isfinite(boundary):
+            raise ValueError("preferred event boundaries must be finite")
+        if boundary <= 0.0 or boundary >= duration:
+            raise ValueError("preferred event boundaries must lie strictly inside the video")
+        raw.append(boundary)
+
+    selected: list[float] = []
+    for boundary in sorted(set(raw)):
+        if boundary < min_segment_seconds or duration - boundary < min_segment_seconds:
+            continue
+        if selected and boundary - selected[-1] < min_segment_seconds:
+            continue
+        selected.append(boundary)
+    return selected
+
+
 def build_event_segments(
     duration: float,
     scan_points: Sequence[VisualScanPoint | SidekickScanPoint],
     *,
+    preferred_boundaries: Sequence[float] = (),
     min_segment_seconds: float = 4.0,
     max_segment_seconds: float = 24.0,
     boundary_quantile: float = 0.80,
     max_segments: int = 96,
 ) -> list[EventSegment]:
-    """Convert a dense hybrid sidekick scan into variable-length event segments."""
+    """Convert hybrid local novelty plus global semantic structure into segments.
+
+    ``preferred_boundaries`` are query-agnostic global change points, e.g. from a
+    KTS dynamic program. Local visual/semantic novelty remains useful for sharp
+    transitions omitted by global model selection. Neither signal establishes
+    query relevance; both only define where the expensive observer should look.
+    """
 
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError("duration must be finite and positive")
@@ -302,10 +337,16 @@ def build_event_segments(
     if not points:
         points = [SidekickScanPoint(0.0, 0.0, 0.0, 0.0)]
 
+    global_boundaries = _preferred_boundaries(
+        duration,
+        preferred_boundaries,
+        min_segment_seconds=min_segment_seconds,
+    )
+
     positive_scores = [point.fused_score for point in points if point.fused_score > 0.0]
     boundary_threshold = _quantile(positive_scores, boundary_quantile) if positive_scores else float("inf")
 
-    candidate_boundaries: list[float] = []
+    local_boundaries: list[float] = []
     for idx, point in enumerate(points):
         if point.timestamp <= 0.0 or point.timestamp >= duration:
             continue
@@ -316,14 +357,30 @@ def build_event_segments(
             and point.fused_score >= right
             and (point.fused_score > left or point.fused_score > right)
         )
-        if point.fused_score >= boundary_threshold and is_strict_local_peak:
-            candidate_boundaries.append(float(point.timestamp))
+        if point.fused_score < boundary_threshold or not is_strict_local_peak:
+            continue
+        candidate = float(point.timestamp)
+        if candidate < min_segment_seconds or duration - candidate < min_segment_seconds:
+            continue
+        # Give the global KTS structure precedence when two proposals describe the
+        # same temporal transition at slightly different timestamps.
+        if any(abs(candidate - global_boundary) < min_segment_seconds for global_boundary in global_boundaries):
+            continue
+        local_boundaries.append(candidate)
+
+    candidate_boundaries = sorted(set(global_boundaries + local_boundaries))
 
     boundaries = [0.0]
     for candidate in candidate_boundaries:
+        # If a meaningful boundary lies just beyond the maximum-duration limit,
+        # place the forced split early enough to preserve that boundary instead of
+        # blindly splitting at last+max and then discarding the semantic boundary.
         while candidate - boundaries[-1] > max_segment_seconds:
-            forced = boundaries[-1] + max_segment_seconds
-            if duration - forced < min_segment_seconds:
+            forced = min(
+                boundaries[-1] + max_segment_seconds,
+                candidate - min_segment_seconds,
+            )
+            if forced - boundaries[-1] < min_segment_seconds:
                 break
             boundaries.append(forced)
         if candidate - boundaries[-1] < min_segment_seconds:
@@ -333,8 +390,11 @@ def build_event_segments(
         boundaries.append(candidate)
 
     while duration - boundaries[-1] > max_segment_seconds:
-        forced = boundaries[-1] + max_segment_seconds
-        if duration - forced < min_segment_seconds:
+        forced = min(
+            boundaries[-1] + max_segment_seconds,
+            duration - min_segment_seconds,
+        )
+        if forced - boundaries[-1] < min_segment_seconds:
             break
         boundaries.append(forced)
     boundaries.append(duration)
@@ -345,6 +405,11 @@ def build_event_segments(
             canonical.append(value)
     if canonical[-1] != duration:
         canonical[-1] = duration
+
+    if any(right - left < min_segment_seconds - 1e-9 for left, right in zip(canonical, canonical[1:])):
+        raise RuntimeError("event segmentation produced a segment shorter than min_segment_seconds")
+    if any(right - left > max_segment_seconds + 1e-9 for left, right in zip(canonical, canonical[1:])):
+        raise RuntimeError("event segmentation produced a segment longer than max_segment_seconds")
 
     if len(canonical) - 1 > max_segments:
         raise ValueError(
