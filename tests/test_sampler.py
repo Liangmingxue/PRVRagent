@@ -1,6 +1,10 @@
 import pytest
 
-from prvr_agent.video.event_segments import VisualScanPoint, build_event_segments
+from prvr_agent.video.event_segments import (
+    VisualScanPoint,
+    build_event_segments,
+    semantic_scores_to_scan_points,
+)
 from prvr_agent.video.sampler import TimeWindow, build_overlapping_windows, uniform_bin_center_indices
 
 
@@ -55,6 +59,13 @@ def test_bin_center_sampling_returns_every_frame_when_budget_is_dense():
     assert uniform_bin_center_indices(5, 8, 10) == [5, 6, 7, 8]
 
 
+def test_semantic_change_scores_map_to_uniform_bin_boundaries():
+    points = semantic_scores_to_scan_points([0.0, 0.1, 0.9, 0.2, 0.1], duration=100.0)
+    assert [point.timestamp for point in points] == pytest.approx([0.0, 20.0, 40.0, 60.0, 80.0])
+    # The strong change at index 2 is the boundary before semantic bin 2: 2/5 T.
+    assert points[2].timestamp == pytest.approx(40.0)
+
+
 def test_event_segmenter_uses_visual_change_peak_as_boundary():
     points = [VisualScanPoint(timestamp=float(t), change_score=0.02) for t in range(0, 31, 2)]
     # A strong transition around 12 s should become an adaptive event boundary.
@@ -71,6 +82,23 @@ def test_event_segmenter_uses_visual_change_peak_as_boundary():
     assert segments[-1].end == 30.0
     assert any(abs(segment.end - 12.0) < 1e-6 for segment in segments)
     assert all(segment.end - segment.start <= 20.0 + 1e-9 for segment in segments)
+
+
+def test_global_semantic_boundary_survives_forced_locality_split():
+    # A naive forced split at 20 s would make the meaningful 22 s boundary too
+    # close and discard it. The event builder should instead force at 18 s so the
+    # 22 s structural boundary can be retained while respecting max duration.
+    segments = build_event_segments(
+        40.0,
+        [VisualScanPoint(timestamp=0.0, change_score=0.0)],
+        preferred_boundaries=[22.0],
+        min_segment_seconds=4.0,
+        max_segment_seconds=20.0,
+        max_segments=8,
+    )
+    boundaries = [segment.end for segment in segments[:-1]]
+    assert 22.0 in boundaries
+    assert all(4.0 - 1e-9 <= segment.end - segment.start <= 20.0 + 1e-9 for segment in segments)
 
 
 def test_event_segmenter_forces_locality_even_without_visual_peaks():
