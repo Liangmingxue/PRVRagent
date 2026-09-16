@@ -9,9 +9,16 @@ from prvr_agent.video.event_segments import (
 )
 
 
-def test_semantic_trace_maps_uniform_positions_to_video_time():
+def test_semantic_trace_maps_uniform_bin_boundaries_to_video_time():
     points = semantic_scores_to_scan_points([0.0, 0.1, 1.0], 20.0)
-    assert [point.timestamp for point in points] == [0.0, 10.0, 20.0]
+    # Three semantic values represent three temporal bins.  Score i is the
+    # boundary before bin i, so the timestamps are i/3 * T rather than endpoint
+    # samples i/2 * T.
+    assert [point.timestamp for point in points] == pytest.approx([
+        0.0,
+        20.0 / 3.0,
+        40.0 / 3.0,
+    ])
     assert points[-1].change_score == 1.0
 
 
