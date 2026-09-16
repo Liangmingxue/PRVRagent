@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ from .event_segments import VisualScanPoint
 
 
 DEFAULT_FRAME_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+FRAME_DIRECTORY_FPS_ENV = "PRVR_FRAME_DIRECTORY_FPS"
 
 
 @dataclass(frozen=True)
@@ -34,13 +36,7 @@ class TimeWindow:
 
 
 class TemporalVisualSource(Protocol):
-    """Minimal temporal-visual interface consumed by the APEI observer.
-
-    Raw compressed videos and pre-extracted frame directories expose the same
-    temporal sampling contract.  Keeping this protocol query-agnostic lets TVR-
-    style frame releases use the same APEI observation policy as datasets for
-    which original video files are available.
-    """
+    """Common APEI input contract for videos and extracted-frame releases."""
 
     frame_count: int
     fps: float
@@ -65,11 +61,7 @@ def build_overlapping_windows(
     overlap: float = 0.25,
     max_windows: int = 64,
 ) -> list[TimeWindow]:
-    """Cover a video with bounded-width overlapping chunks, without peak guidance.
-
-    Kept as a baseline/fallback utility. The primary APEI observer now uses
-    event-aware segments proposed by a dense lightweight sidekick scan.
-    """
+    """Cover a video with bounded-width overlapping chunks, without peak guidance."""
 
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError("duration must be finite and positive")
@@ -216,7 +208,6 @@ def _visual_change_scan(
             if previous is None:
                 change = 0.0
             else:
-                # Defensively crop malformed streams/directories with shape drift.
                 height = min(previous.shape[0], current.shape[0])
                 width = min(previous.shape[1], current.shape[1])
                 diff = np.abs(previous[:height, :width] - current[:height, :width])
@@ -231,8 +222,38 @@ def _visual_change_scan(
     return points
 
 
+def _frame_directory_fps_from_env() -> float | None:
+    raw = os.getenv(FRAME_DIRECTORY_FPS_ENV)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{FRAME_DIRECTORY_FPS_ENV} must be numeric") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{FRAME_DIRECTORY_FPS_ENV} must be finite and positive")
+    return value
+
+
 class DecordFrameSampler:
-    """TemporalVisualSource backed by a compressed video file."""
+    """TemporalVisualSource backed by a compressed video file.
+
+    For backward compatibility with the existing observer, constructing this
+    class on a directory dispatches to ``FrameDirectorySampler`` when
+    ``PRVR_FRAME_DIRECTORY_FPS`` is explicitly configured.  New code should use
+    ``open_temporal_visual_source`` directly.
+    """
+
+    def __new__(cls, video_path: str | Path):
+        path = Path(video_path).expanduser()
+        if cls is DecordFrameSampler and path.is_dir():
+            fps = _frame_directory_fps_from_env()
+            if fps is None:
+                raise ValueError(
+                    f"{FRAME_DIRECTORY_FPS_ENV} is required when the APEI source is an extracted-frame directory"
+                )
+            return FrameDirectorySampler(path, fps=fps)
+        return super().__new__(cls)
 
     def __init__(self, video_path: str | Path) -> None:
         try:
@@ -240,10 +261,10 @@ class DecordFrameSampler:
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("Install the optional 'video' dependencies to read raw video") from exc
 
-        path = Path(video_path)
+        path = Path(video_path).expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(f"video file does not exist: {video_path}")
-        self.path = path.resolve()
+        self.path = path
         self._vr = VideoReader(str(self.path))
         self.frame_count = len(self._vr)
         if self.frame_count <= 0:
@@ -302,9 +323,9 @@ def _natural_path_key(path: Path) -> tuple:
 class FrameDirectorySampler:
     """TemporalVisualSource backed by an ordered directory of extracted frames.
 
-    The frame rate is intentionally explicit.  Public frame releases such as TVQA
-    often use a known extraction rate (historically 3 fps), but silently assuming
-    that rate for an arbitrary directory would corrupt event timestamps.
+    The extraction rate is explicit because dataset frame releases differ.  TVQA
+    preprocessing, for example, uses 3 fps, but this sampler never hard-codes that
+    dataset-specific value.
     """
 
     def __init__(
@@ -408,10 +429,12 @@ def open_temporal_visual_source(
     if source_path.is_file():
         return DecordFrameSampler(source_path)
     if source_path.is_dir():
-        if frame_directory_fps is None:
+        fps = frame_directory_fps
+        if fps is None:
+            fps = _frame_directory_fps_from_env()
+        if fps is None:
             raise ValueError(
-                "frame_directory_fps is required for extracted-frame sources; "
-                "do not silently assume a dataset-specific FPS"
+                "frame_directory_fps (or PRVR_FRAME_DIRECTORY_FPS) is required for extracted-frame sources"
             )
-        return FrameDirectorySampler(source_path, fps=float(frame_directory_fps))
+        return FrameDirectorySampler(source_path, fps=float(fps))
     raise FileNotFoundError(f"temporal visual source does not exist: {source_path}")
