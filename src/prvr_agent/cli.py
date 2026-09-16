@@ -18,6 +18,25 @@ def _load_json_list(path: str | Path, *, name: str) -> list[str]:
     return payload
 
 
+def _coverage_output(resolver, roots: list[str], expected_path: str | None) -> dict[str, object]:
+    output: dict[str, object] = {
+        "indexed_sources": len(resolver),
+        "roots": [str(Path(root).expanduser().resolve()) for root in roots],
+    }
+    if expected_path:
+        expected = _load_json_list(expected_path, name="expected_video_ids")
+        indexed = set(resolver.video_ids())
+        missing = [video_id for video_id in expected if video_id not in indexed]
+        output.update(
+            {
+                "expected_videos": len(expected),
+                "missing_count": len(missing),
+                "missing_video_ids": missing[:50],
+            }
+        )
+    return output
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="PRVR-Agent utility CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -52,6 +71,16 @@ def main() -> None:
     )
     p_videos.add_argument("roots", nargs="+", help="One or more raw-video root directories")
     p_videos.add_argument(
+        "--expected-video-ids",
+        help="Optional JSON array of benchmark video ids that must all be present",
+    )
+
+    p_frames = sub.add_parser(
+        "index-frames",
+        help="Index extracted-frame directories by directory name and optionally verify benchmark coverage",
+    )
+    p_frames.add_argument("roots", nargs="+", help="One or more frame root directories")
+    p_frames.add_argument(
         "--expected-video-ids",
         help="Optional JSON array of benchmark video ids that must all be present",
     )
@@ -105,22 +134,17 @@ def main() -> None:
         from .evaluation import IndexedVideoPathResolver
 
         resolver = IndexedVideoPathResolver.from_roots(args.roots)
-        output: dict[str, object] = {
-            "indexed_videos": len(resolver),
-            "roots": [str(Path(root).expanduser().resolve()) for root in args.roots],
-        }
-        if args.expected_video_ids:
-            expected = _load_json_list(args.expected_video_ids, name="expected_video_ids")
-            indexed = set(resolver.video_ids())
-            missing = [video_id for video_id in expected if video_id not in indexed]
-            output.update(
-                {
-                    "expected_videos": len(expected),
-                    "missing_count": len(missing),
-                    "missing_video_ids": missing[:50],
-                }
-            )
-            if missing:
-                print(json.dumps(output, indent=2, ensure_ascii=False))
-                raise SystemExit(2)
+        output = _coverage_output(resolver, args.roots, args.expected_video_ids)
+        output["source_kind"] = "raw_video"
         print(json.dumps(output, indent=2, ensure_ascii=False))
+        if output.get("missing_count", 0):
+            raise SystemExit(2)
+    elif args.cmd == "index-frames":
+        from .evaluation import IndexedFrameDirectoryResolver
+
+        resolver = IndexedFrameDirectoryResolver.from_roots(args.roots)
+        output = _coverage_output(resolver, args.roots, args.expected_video_ids)
+        output["source_kind"] = "extracted_frames"
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+        if output.get("missing_count", 0):
+            raise SystemExit(2)
