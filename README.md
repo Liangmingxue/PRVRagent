@@ -16,11 +16,12 @@ query
   -> DreamPRVR top-K candidates
   -> hybrid query-agnostic sidekick scan
        -> dense low-resolution pixel-change trace
-       -> cached DreamPRVR semantic-feature novelty trace
+       -> cached DreamPRVR semantic features
+       -> local semantic novelty + global kernel temporal segmentation
        -> robust visual/semantic fusion
   -> event-aware variable-length temporal segments
   -> coarse CQHG + event-world assessment per segment
-  -> coverage-aware dense re-observation of ambiguous/high-novelty segments
+  -> bounded relevance+coverage dense re-observation
   -> choose one short contiguous candidate span
   -> isolated single-span temporal confirmation with explicit event timestamps
   -> revise event-world beliefs from confirmed evidence
@@ -58,13 +59,31 @@ Each world contains a prior probability, every CQHG atomic-event id exactly once
 
 The long-video observer no longer relies on one whole-video uniform sample or fixed DreamPRVR peak locations. It uses four APEI-internal observation stages.
 
-**1. Hybrid query-agnostic sidekick scan.** The raw-video sidekick densely samples inexpensive low-resolution luminance changes. In parallel, `DreamPRVRAdapter` reuses the already-computed chronological `video_feat` representations and `video_mask` to derive a query-agnostic semantic novelty trace from adjacent and short-context cosine changes. The two modalities are robustly normalized per video and fused before event-boundary proposal. This lets low-motion semantic transitions survive even when raw pixel change is weak. If the upstream mask/semantic trace is unavailable, the observer safely falls back to the visual sidekick.
+**1. Hybrid query-agnostic sidekick scan.** The raw-video sidekick densely samples inexpensive low-resolution luminance changes. In parallel, `DreamPRVRAdapter` reuses the already-computed chronological `video_feat` representations and `video_mask`. It derives both a local semantic novelty curve and a global kernel-temporal segmentation over the ordered semantic features. The two visual/semantic signals are robustly normalized per video before event-boundary proposal. This lets low-motion semantic transitions survive even when raw pixel change is weak. If the upstream mask/semantic trace is unavailable, the observer safely falls back to the visual sidekick.
 
 The semantic sidekick is deliberately **not** a query-frame similarity score: it never sees the retrieval query, never exports a DreamPRVR argmax, and cannot directly contribute hard CQHG relevance. Its only role is to improve temporal structure discovery and observation allocation.
 
-**2. Adaptive event segmentation.** `build_event_segments()` turns local maxima of the fused visual/semantic sidekick trace into variable-length event proposals while enforcing a maximum segment duration. Quiet regions are force-split instead of silently becoming extremely long segments. The default maximum duration is 20 s and the default minimum duration is 4 s.
+The global semantic segmenter is implemented independently in `video/kernel_temporal.py` from the KTS mathematical objective rather than by vendoring third-party KTS code. For an L2-normalized feature sequence with linear kernel `K`, the interval cost is the within-segment kernel scatter
 
-**3. Coverage-aware dense re-observation.** Every event segment receives a low-cost VLM pass. A small number of segments are re-observed with more frames according to a priority combining hybrid sidekick salience, partial CQHG coverage, unresolved relations, Qwen uncertainty, support/contradiction conflict, and prospective-world hints. Strong semantic/visual sidekick evidence can therefore trigger refinement even when the first sparse Qwen pass is incorrectly overconfident. Temporal diversity prevents all refinement budget from collapsing onto one neighborhood.
+```text
+J(i,j) = sum_t K_tt - (1 / length) * sum_{s,t} K_st,
+```
+
+and dynamic programming finds the minimum-cost contiguous segmentation. The number of change points is selected with the KTS-style complexity penalty exposed as a validation-time hyperparameter.
+
+DreamPRVR frame positions are treated as **uniform temporal bins**, not endpoint samples. If KTS selects change point `c` in a sequence of `N` semantic bins, its approximate physical boundary is therefore
+
+```text
+t_boundary = (c / N) * video_duration
+```
+
+rather than `c / (N - 1) * video_duration`.
+
+**2. Adaptive event segmentation.** `build_event_segments()` combines global semantic structure with local visual/semantic novelty into variable-length event proposals while enforcing minimum and maximum segment durations. Quiet regions are force-split instead of silently becoming extremely long segments. The split logic preserves nearby meaningful global boundaries rather than creating a forced split that immediately suppresses them. The default maximum duration is 20 s and the default minimum duration is 4 s.
+
+**3. Coverage-safe dense re-observation.** Every event segment first receives a low-cost VLM pass. A small bounded number of segments are then re-observed with more frames according to a priority combining hybrid sidekick salience, partial CQHG coverage, unresolved relations, Qwen uncertainty, support/contradiction conflict, and prospective-world hints. Temporal diversity prevents the budget from collapsing onto one neighborhood.
+
+The default refinement threshold is now `0.0`: all coarse event segments remain eligible for the bounded refinement budget (`max_refinement_chunks=3` by default). This is intentional. A hard pre-filter can terminate refinement when the sparse coarse pass is confidently wrong; keeping all coarse segments eligible lets relevance priority and temporal coverage decide how to spend the fixed refinement budget. A positive threshold remains available as an ablation/configuration option.
 
 **4. Isolated contiguous-span confirmation.** Adjacent partial event segments may jointly propose one short contiguous span, but their evidence is not directly unioned into the final CQHG score. The proposed span is sent to a clean Qwen request that contains only that span. Final hard event/relation evidence must be re-observed from scratch in this isolated request. This prevents cross-attention between distant segments in a batched coarse request from becoming final evidence, while still allowing a true event that straddles one adaptive boundary to be confirmed.
 
@@ -84,12 +103,13 @@ The final score fuses three terms: the original DreamPRVR score, hard CQHG satis
 
 ## Why the observation policy is structured this way
 
-The implementation follows several published long-video findings rather than treating sparse Qwen uncertainty as a sufficient selector:
+The implementation follows published long-video findings rather than treating sparse Qwen uncertainty as a sufficient selector:
 
 - **DeCafNet (CVPR 2025)** motivates a cheap dense sidekick followed by expensive expert processing only where needed.
-- **Kernel Temporal Segmentation as an Adaptive Tokenizer (ICCVW 2023)** motivates task-agnostic feature-space temporal segmentation into variable-length semantically consistent units instead of fixed uniform chunks. PRVR-Agent currently uses a lightweight KTS-inspired semantic novelty signal; it does **not** claim to implement the full KTS dynamic-programming objective.
+- **Kernel Temporal Segmentation as an Adaptive Tokenizer (ICCVW 2023)** motivates task-agnostic feature-space temporal segmentation into variable-length semantically consistent units instead of fixed uniform chunks. PRVR-Agent now includes an independent KTS-style global dynamic-programming segmenter plus a local semantic novelty signal.
 - **KTV (AAAI 2026)** supports question-agnostic feature-based preselection to avoid coupling the prefilter to query similarity.
-- **AKS (CVPR 2025)** motivates balancing informative evidence with temporal coverage rather than concentrating a fixed budget in one region.
+- **AKS (CVPR 2025)** motivates balancing informative evidence with temporal coverage under a fixed observation budget.
+- **FOCUS (ICLR 2026)** motivates coarse exploration across the full temporal search space before fine exploitation; in particular, it highlights that hard pre-filtering can discard the most informative moments.
 - **From Frames to Clips (2025)** motivates keeping short temporally coherent spans instead of reasoning only from isolated keyframes.
 
 These references motivate the observation policy only. CQHG and prospective event-world belief revision remain the actual PRVR contributions.
@@ -112,11 +132,12 @@ DreamPRVR still uses its own internal max-similarity mechanism to produce normal
 - `src/prvr_agent/agents/hypothesis_planner.py`: CQHG generation.
 - `src/prvr_agent/agents/world_model.py`: abductive prospective event-world generation.
 - `src/prvr_agent/agents/world_observer.py`: hybrid sidekick fusion, coarse event assessment, coverage-aware refinement, isolated confirmation, and coherence-preserving aggregation.
+- `src/prvr_agent/video/kernel_temporal.py`: independent global kernel-temporal dynamic programming and semantic-boundary mapping.
 - `src/prvr_agent/video/event_segments.py`: visual/semantic sidekick fusion and adaptive event-segment construction.
 - `src/prvr_agent/video/sampler.py`: raw-video frame sampling and dense low-resolution visual-change scan.
 - `src/prvr_agent/prospective.py`: CQHG scoring, prior normalization, posterior belief revision, and score fusion.
 - `src/prvr_agent/pipeline.py`: end-to-end CQHG + APEI reranking.
-- `src/prvr_agent/retriever/dreamprvr_adapter.py`: DreamPRVR top-K adapter plus query-agnostic semantic sidekick trace; no peak export.
+- `src/prvr_agent/retriever/dreamprvr_adapter.py`: DreamPRVR top-K adapter plus query-agnostic local/global semantic sidekick structure; no peak export.
 
 ## Installation
 
@@ -175,7 +196,7 @@ prvr-agent imagine "a man washes his hands and then opens the refrigerator" --nu
 
 ## DreamPRVR integration
 
-The adapter reproduces upstream clip/frame max-similarity scores used to rank candidates but no longer returns argmax locations. When `context_info["video_mask"]` is present, it additionally attaches a query-agnostic semantic temporal-change trace to each returned candidate so APEI can reuse the cached video representation without another heavy encoder pass.
+The adapter reproduces upstream clip/frame max-similarity scores used to rank candidates but no longer returns argmax locations. When `context_info["video_mask"]` is present, it additionally attaches query-agnostic local semantic novelty and global kernel-temporal boundaries to each returned candidate so APEI can reuse the cached video representation without another heavy encoder pass.
 
 ```python
 from prvr_agent.retriever import DreamPRVRAdapter
@@ -192,16 +213,16 @@ batch = adapter.retrieve(query_feat, query_mask, top_k=20)
 candidates = batch.candidates[0]
 ```
 
-Default APEI observation uses a 2 FPS low-resolution raw-video sidekick capped at 512 frames, equal initial weights for visual/semantic sidekick fusion, adaptive event segments up to 20 s long, 4 VLM frames per coarse segment, up to three 12-frame dense re-observations, and a 16-frame isolated confirmation over at most two adjacent segments / 40 s. These are research defaults and must be calibrated on validation data; the 0.5/0.5 fusion weights are not claimed as literature-derived constants.
+Default APEI observation uses a 2 FPS low-resolution raw-video sidekick capped at 512 frames, equal initial weights for visual/semantic sidekick fusion, adaptive event segments up to 20 s long, 4 VLM frames per coarse segment, three 12-frame dense re-observations selected from all coarse segments using relevance+coverage, and a 16-frame isolated confirmation over at most two adjacent segments / 40 s. These are research defaults and must be calibrated on validation data; the 0.5/0.5 fusion weights and KTS penalty are not claimed as literature-derived optimal constants.
 
 ## Research status
 
 This branch is still an MVP research scaffold. Before benchmark reporting, the main remaining work is:
 
 - validate Qwen3-VL CQHG, event timestamp, isolated confirmation, and world-generation quality on real TVR / ActivityNet Captions / Charades-STA queries;
-- calibrate visual-vs-semantic sidekick fusion, scan rate, event boundary quantile, segment duration, coarse/refinement/confirmation frame budgets, and compute/recall trade-offs on validation data;
-- ablate `visual-only`, `semantic-only`, `hybrid`, fixed-chunk, and whole-video uniform observation policies;
-- compare simple semantic novelty against an exact KTS implementation or other learned sidekick only if the lightweight variant is insufficient;
+- calibrate visual-vs-semantic sidekick fusion, KTS penalty / maximum change points, scan rate, event boundary quantile, segment duration, coarse/refinement/confirmation frame budgets, and compute/recall trade-offs on validation data;
+- ablate `visual-only`, `local-semantic`, `KTS-global`, `hybrid`, fixed-chunk, and whole-video uniform observation policies;
+- ablate refinement threshold `0.0` against positive-threshold pre-filtering to measure the accuracy/compute effect of coverage-safe refinement;
 - add benchmark-specific video-id -> path resolution;
 - calibrate `base_weight`, `graph_weight`, `world_weight`, support/contradiction scales on validation data only;
 - add official PRVR R@K / SumR evaluation and ablations against single-caption/query-expansion baselines;
