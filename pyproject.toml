@@ -17,12 +17,25 @@ dependencies = [
 torch = ["torch>=2.0"]
 video = ["decord>=0.6", "Pillow>=10.0"]
 llm = ["openai>=1.40"]
+benchmark = [
+  "torch>=2.0",
+  "h5py>=3.8",
+  "easydict>=1.10",
+  "PyYAML>=6.0",
+  "tqdm>=4.64",
+  "ipdb>=0.13",
+]
 dev = ["pytest>=8.0"]
 all = [
   "torch>=2.0",
   "decord>=0.6",
   "Pillow>=10.0",
   "openai>=1.40",
+  "h5py>=3.8",
+  "easydict>=1.10",
+  "PyYAML>=6.0",
+  "tqdm>=4.64",
+  "ipdb>=0.13",
   "pytest>=8.0",
 ]
 

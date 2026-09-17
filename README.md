@@ -238,6 +238,27 @@ prvr-agent imagine "a man washes his hands and then opens the refrigerator" --nu
 
 The adapter reproduces upstream clip/frame max-similarity scores used to rank candidates but no longer returns argmax locations. When `context_info["video_mask"]` is present, it additionally attaches query-agnostic local semantic novelty and global kernel-temporal boundaries to each returned candidate so APEI can reuse the cached video representation without another heavy encoder pass.
 
+The end-to-end command now loads an official DreamPRVR checkpoint, invokes the
+official `get_datasets` / `get_models` / `get_validations` builders, computes the
+official test context, validates all temporal visual sources, and runs CQHG/APEI:
+
+```bash
+prvr-agent benchmark-dreamprvr \
+  --dreamprvr-root /path/to/CVPR26-DreamPRVR \
+  --checkpoint /path/to/best.ckpt \
+  --data-root /path/to/DreamPRVR \
+  --dataset activitynet \
+  --visual-root /path/to/activitynet/raw_videos \
+  --top-k 10 \
+  --max-queries 10 \
+  --output-dir runs/activitynet-smoke-k10
+```
+
+TVR uses frame directories and additionally requires
+`--frame-directory-fps 3` for the corresponding 3-FPS release. ActivityNet and
+Charades use raw videos. See [docs/benchmark_integration.md](docs/benchmark_integration.md)
+for all three commands, output files, and the full `K=10/20/50` workflow.
+
 ```python
 from prvr_agent.retriever import DreamPRVRAdapter
 
@@ -257,7 +278,7 @@ Default APEI observation uses a 2 FPS low-resolution raw-video sidekick capped a
 
 ## Research status
 
-This branch is still an MVP research scaffold. Before benchmark reporting, the main remaining work is:
+The one-command benchmark wiring is implemented. Before benchmark reporting, the remaining work is experimental validation and calibration:
 
 - validate Qwen3-VL CQHG, event timestamp, isolated confirmation, and world-generation quality on real TVR / ActivityNet Captions / Charades-STA queries;
 - calibrate visual-vs-semantic sidekick fusion, KTS penalty / maximum change points, scan rate, event boundary quantile, segment duration, coarse/refinement/confirmation frame budgets, and compute/recall trade-offs on validation data;
@@ -265,6 +286,5 @@ This branch is still an MVP research scaffold. Before benchmark reporting, the m
 - ablate refinement threshold `0.0` against positive-threshold pre-filtering to measure the accuracy/compute effect of coverage-safe refinement;
 - ablate DreamPRVR shortlist size `K` because APEI cannot recover a relevant video outside the shortlist;
 - calibrate `base_weight`, `graph_weight`, `world_weight`, support/contradiction scales on validation data only;
-- connect the existing metric/rank-slot/video-resolution utilities into one dataset-specific end-to-end benchmark command after the local raw-video locations and DreamPRVR checkpoint layout are known;
 - add ablations against single-caption/query-expansion baselines;
 - log segment boundaries, visual/semantic/fused sidekick salience, refinement choices, confirmation span, CQHG event timestamps, generated worlds, and posterior changes for qualitative analysis.

@@ -66,7 +66,117 @@ This matches the upstream validation path rather than assuming our adapter is th
 The public DreamPRVR `TxtDataSet4PRVR` stores the original query strings in
 `query_eval_loader.dataset.captions`, so the bridge uses the original query text directly. It does not try to decode or reconstruct text from the precomputed RoBERTa features.
 
-## 3. Minimal integration with the public DreamPRVR validation objects
+## 3. One-command official DreamPRVR benchmark
+
+The runnable entrypoint now performs the complete public DreamPRVR path:
+
+```text
+official checkpoint config/state_dict
+  -> get_datasets(cfg)
+  -> get_models(cfg) + strict checkpoint load
+  -> get_validations(cfg).compute_context_info(model, test_context_dataloader)
+  -> test_query_eval_loader
+  -> authoritative DreamPRVR full scores
+  -> CQHG/APEI Top-K reranking
+  -> full matrices + R@K/Rsum manifest
+```
+
+Use the official checkout and feature layout described by DreamPRVR. `--data-root`
+is the directory that contains `activitynet/`, `charades/`, or `tvr/`, not the
+collection directory itself. The checkpoint loader uses PyTorch's restricted
+`weights_only=True` mode and requires the official checkpoint keys `config` and
+`state_dict`; it never silently performs an unrestricted pickle load.
+
+Before the first run, configure the already-running local Qwen3-VL vLLM service:
+
+```bash
+export PRVR_LLM_BASE_URL=http://127.0.0.1:8000/v1
+export PRVR_LLM_API_KEY=EMPTY
+export PRVR_LLM_MODEL=Qwen3-VL-8B-Instruct-FP8
+
+prvr-agent check-llm
+```
+
+Use the exact model id returned by `/v1/models`. If vLLM is already occupying
+physical GPU 1, run DreamPRVR on a different visible GPU to avoid model-memory
+contention, for example `CUDA_VISIBLE_DEVICES=0` with `--device cuda:0`.
+
+### TVR extracted frames
+
+The corresponding TVQA/TVR frame release uses 3 FPS, but the rate remains an
+explicit command argument because other extracted-frame releases may differ:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 prvr-agent benchmark-dreamprvr \
+  --dreamprvr-root /path/to/CVPR26-DreamPRVR \
+  --checkpoint /path/to/tvr/best.ckpt \
+  --data-root /path/to/DreamPRVR \
+  --dataset tvr \
+  --visual-root /path/to/tvqa_frames \
+  --frame-directory-fps 3 \
+  --top-k 10 \
+  --max-queries 10 \
+  --device cuda:0 \
+  --output-dir runs/tvr-smoke-k10
+```
+
+### ActivityNet Captions raw videos
+
+ActivityNet paths are indexed recursively by filename stem. Thus a benchmark id
+such as `v_demo` must resolve to exactly one file such as `v_demo.mp4`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 prvr-agent benchmark-dreamprvr \
+  --dreamprvr-root /path/to/CVPR26-DreamPRVR \
+  --checkpoint /path/to/activitynet/best.ckpt \
+  --data-root /path/to/DreamPRVR \
+  --dataset activitynet \
+  --visual-root /path/to/activitynet/raw_videos \
+  --top-k 10 \
+  --max-queries 10 \
+  --device cuda:0 \
+  --output-dir runs/activitynet-smoke-k10
+```
+
+### Charades-STA raw videos
+
+Charades paths are also indexed recursively by exact filename stem:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 prvr-agent benchmark-dreamprvr \
+  --dreamprvr-root /path/to/CVPR26-DreamPRVR \
+  --checkpoint /path/to/charades/best.ckpt \
+  --data-root /path/to/DreamPRVR \
+  --dataset charades \
+  --visual-root /path/to/Charades_v1_480 \
+  --top-k 10 \
+  --max-queries 10 \
+  --device cuda:0 \
+  --output-dir runs/charades-smoke-k10
+```
+
+The command rejects duplicate filename stems, missing benchmark videos,
+checkpoint/dataset mismatches, and TVR runs without an explicit FPS before any
+expensive Qwen request is sent.
+
+Each output directory contains:
+
+```text
+benchmark_result.json
+dreamprvr_base_scores.npy
+dreamprvr_cqhg_apei_scores.npy
+query_ids.json
+video_ids.json
+```
+
+The manifest records the paths/configuration, DreamPRVR fusion weights, baseline
+and reranked metrics, metric deltas, query/video counts, and matrix filenames.
+
+After the 10-query smoke test succeeds, remove `--max-queries` for a full test
+split and repeat with `--top-k 10`, `20`, and `50`. Use a distinct output
+directory for every dataset/K pair so score matrices are never overwritten.
+
+## 4. Programmatic integration with public DreamPRVR objects
 
 After loading the public DreamPRVR model/checkpoint and dataloaders in its normal environment:
 
@@ -122,7 +232,7 @@ result = rerank_dreamprvr_query_loader(
 )
 ```
 
-## 4. Why rank-slot reranking is used
+## 5. Why rank-slot reranking is used
 
 APEI produces a transformed score for only the expensive Top-K shortlist. It is not valid to overwrite those K entries with APEI scores and then compare them numerically with untouched DreamPRVR scores outside the shortlist.
 
@@ -135,7 +245,7 @@ Instead, the integration keeps the original DreamPRVR Top-K score values as rank
 
 This makes the experiment a strict Top-K reranking experiment.
 
-## 5. Required shortlist ablation
+## 6. Required shortlist ablation
 
 Because the current architecture is
 

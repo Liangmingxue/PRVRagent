@@ -30,7 +30,7 @@ from prvr_agent.video.event_segments import (
     fuse_sidekick_scans,
     semantic_scores_to_scan_points,
 )
-from prvr_agent.video.sampler import DecordFrameSampler, TimeWindow
+from prvr_agent.video.sampler import TemporalVisualSource, TimeWindow, open_temporal_visual_source
 
 MAX_FRAMES_PER_CHUNK = 24
 MAX_CHUNKS = 96
@@ -430,6 +430,7 @@ class OpenAIWorldEvidenceBackend:
         max_image_side: int = 768,
         jpeg_quality: int = 80,
         sampler_cache_size: int = 8,
+        frame_directory_fps: Optional[float] = None,
     ) -> None:
         cfg = config or LLMConfig.from_env()
         cfg.validate()
@@ -439,6 +440,10 @@ class OpenAIWorldEvidenceBackend:
             raise ValueError("jpeg_quality must be in [1, 95]")
         if sampler_cache_size <= 0:
             raise ValueError("sampler_cache_size must be positive")
+        if frame_directory_fps is not None:
+            frame_directory_fps = float(frame_directory_fps)
+            if not math.isfinite(frame_directory_fps) or frame_directory_fps <= 0:
+                raise ValueError("frame_directory_fps must be finite and positive")
         self.client = client or create_openai_compatible_client(cfg)
         self.model = model or cfg.model
         self.temperature = cfg.temperature
@@ -447,16 +452,23 @@ class OpenAIWorldEvidenceBackend:
         self.max_image_side = int(max_image_side)
         self.jpeg_quality = int(jpeg_quality)
         self.sampler_cache_size = int(sampler_cache_size)
-        self._samplers: OrderedDict[str, DecordFrameSampler] = OrderedDict()
+        self.frame_directory_fps = frame_directory_fps
+        self._samplers: OrderedDict[str, TemporalVisualSource] = OrderedDict()
 
     @classmethod
     def from_env(cls) -> "OpenAIWorldEvidenceBackend":
         return cls(config=LLMConfig.from_env())
 
-    def _get_sampler(self, video_path: str) -> DecordFrameSampler:
+    def _get_sampler(self, video_path: str) -> TemporalVisualSource:
         sampler = self._samplers.pop(video_path, None)
         if sampler is None:
-            sampler = DecordFrameSampler(video_path)
+            # The one-click benchmark passes extracted-frame FPS explicitly.
+            # ``open_temporal_visual_source`` retains the environment-variable
+            # fallback for existing callers but never guesses a dataset rate.
+            sampler = open_temporal_visual_source(
+                video_path,
+                frame_directory_fps=self.frame_directory_fps,
+            )
         self._samplers[video_path] = sampler
         while len(self._samplers) > self.sampler_cache_size:
             self._samplers.popitem(last=False)

@@ -85,6 +85,67 @@ def main() -> None:
         help="Optional JSON array of benchmark video ids that must all be present",
     )
 
+    p_benchmark = sub.add_parser(
+        "benchmark-dreamprvr",
+        help="Run official DreamPRVR test retrieval followed by CQHG/APEI Top-K reranking",
+    )
+    p_benchmark.add_argument(
+        "--dreamprvr-root",
+        required=True,
+        help="Official CVPR26-DreamPRVR checkout containing src/",
+    )
+    p_benchmark.add_argument(
+        "--checkpoint",
+        required=True,
+        help="Official DreamPRVR checkpoint for the selected dataset",
+    )
+    p_benchmark.add_argument(
+        "--data-root",
+        required=True,
+        help="DreamPRVR feature root containing activitynet/, charades/, and/or tvr/",
+    )
+    p_benchmark.add_argument(
+        "--dataset",
+        required=True,
+        help="tvr, activitynet/act, or charades/cha",
+    )
+    p_benchmark.add_argument(
+        "--visual-root",
+        dest="visual_roots",
+        action="append",
+        required=True,
+        help="Raw-video root (ActivityNet/Charades) or extracted-frame root (TVR); repeatable",
+    )
+    p_benchmark.add_argument(
+        "--frame-directory-fps",
+        type=float,
+        help="Required for TVR extracted frames; use 3 only for the matching 3-FPS release",
+    )
+    p_benchmark.add_argument("--top-k", type=int, default=20)
+    p_benchmark.add_argument(
+        "--max-queries",
+        type=int,
+        help="Limit expensive Qwen reranking; use 10 for the first smoke test",
+    )
+    p_benchmark.add_argument(
+        "--device",
+        default="auto",
+        help="DreamPRVR device, for example auto, cpu, cuda, or cuda:0",
+    )
+    p_benchmark.add_argument("--num-workers", type=int, default=4)
+    p_benchmark.add_argument("--eval-query-batch-size", type=int)
+    p_benchmark.add_argument("--eval-context-batch-size", type=int)
+    p_benchmark.add_argument(
+        "--output-dir",
+        required=True,
+        help="Directory for full baseline/reranked matrices, ids, and metrics manifest",
+    )
+    p_benchmark.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace benchmark files already present in --output-dir",
+    )
+
     args = parser.parse_args()
     if args.cmd == "plan":
         graph = RuleBasedHypothesisPlanner().plan(args.query)
@@ -148,3 +209,40 @@ def main() -> None:
         print(json.dumps(output, indent=2, ensure_ascii=False))
         if output.get("missing_count", 0):
             raise SystemExit(2)
+    elif args.cmd == "benchmark-dreamprvr":
+        # Importing the integration lazily keeps planner/index commands usable in
+        # lightweight environments without the DreamPRVR torch stack.
+        from .integration import run_dreamprvr_benchmark, save_dreamprvr_benchmark_result
+
+        run = run_dreamprvr_benchmark(
+            dreamprvr_root=args.dreamprvr_root,
+            checkpoint=args.checkpoint,
+            data_root=args.data_root,
+            dataset=args.dataset,
+            visual_roots=args.visual_roots,
+            frame_directory_fps=args.frame_directory_fps,
+            top_k=args.top_k,
+            max_queries=args.max_queries,
+            device=args.device,
+            num_workers=args.num_workers,
+            eval_query_batch_size=args.eval_query_batch_size,
+            eval_context_batch_size=args.eval_context_batch_size,
+        )
+        manifest = save_dreamprvr_benchmark_result(
+            run,
+            args.output_dir,
+            overwrite=args.overwrite,
+        )
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "manifest": str(manifest),
+                    "base_metrics": run.benchmark.base_metrics.as_dict(),
+                    "reranked_metrics": run.benchmark.reranked_metrics.as_dict(),
+                    "metric_delta": run.benchmark.metric_delta(),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
