@@ -69,6 +69,15 @@ def test_bin_center_sampling_returns_every_frame_when_budget_is_dense():
     assert uniform_bin_center_indices(5, 8, 10) == [5, 6, 7, 8]
 
 
+def test_sampling_budgets_reject_bool_and_fractional_values():
+    for count in (True, 1.5):
+        with pytest.raises(ValueError, match="positive integer"):
+            uniform_bin_center_indices(0, 9, count)
+    for max_windows in (True, 2.5):
+        with pytest.raises(ValueError, match="positive integer"):
+            build_overlapping_windows(10.0, max_windows=max_windows)
+
+
 def test_frame_directory_sampler_naturally_orders_frames_and_uses_explicit_fps(tmp_path: Path):
     frame_dir = tmp_path / "clip_01"
     frame_dir.mkdir()

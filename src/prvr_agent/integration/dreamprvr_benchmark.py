@@ -150,10 +150,12 @@ def rerank_dreamprvr_query_loader(
     trying to reconstruct text from precomputed RoBERTa features.
     """
 
-    if top_k <= 0:
-        raise ValueError("top_k must be positive")
-    if max_queries is not None and max_queries <= 0:
-        raise ValueError("max_queries must be positive when provided")
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+        raise ValueError("top_k must be a positive integer")
+    if max_queries is not None and (
+        isinstance(max_queries, bool) or not isinstance(max_queries, int) or max_queries <= 0
+    ):
+        raise ValueError("max_queries must be a positive integer when provided")
     for name, value in (
         ("clip_scale_weight", clip_scale_weight),
         ("frame_scale_weight", frame_scale_weight),

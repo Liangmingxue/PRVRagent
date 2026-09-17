@@ -121,3 +121,19 @@ def test_pipeline_rejects_invalid_hybrid_sidekick_weights():
             assert "sidekick" in str(exc)
         else:
             raise AssertionError("expected invalid hybrid sidekick weights to fail")
+
+
+def test_pipeline_rejects_bool_and_fractional_integer_budgets():
+    for kwargs in (
+        {"num_worlds": True},
+        {"frames_per_chunk": 4.5},
+        {"max_chunks": True},
+        {"context_radius": 0.5},
+        {"max_refinement_chunks": False},
+    ):
+        try:
+            PipelineConfig(**kwargs).validate()
+        except ValueError as exc:
+            assert "integer" in str(exc)
+        else:
+            raise AssertionError("expected non-integer budget to fail")

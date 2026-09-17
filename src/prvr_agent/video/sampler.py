@@ -14,6 +14,11 @@ DEFAULT_FRAME_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 FRAME_DIRECTORY_FPS_ENV = "PRVR_FRAME_DIRECTORY_FPS"
 
 
+def _require_positive_integer(value: int, *, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+
+
 @dataclass(frozen=True)
 class TimeWindow:
     start: float
@@ -69,8 +74,7 @@ def build_overlapping_windows(
         raise ValueError("target_seconds must be finite and positive")
     if not math.isfinite(overlap) or not 0.0 <= overlap < 1.0:
         raise ValueError("overlap must be in [0, 1)")
-    if max_windows <= 0:
-        raise ValueError("max_windows must be positive")
+    _require_positive_integer(max_windows, name="max_windows")
 
     duration = float(duration)
     width = min(float(target_seconds), duration)
@@ -100,8 +104,7 @@ def uniform_bin_center_indices(start_frame: int, end_frame: int, count: int) -> 
 
     if start_frame < 0 or end_frame < start_frame:
         raise ValueError("invalid frame range")
-    if count <= 0:
-        raise ValueError("count must be positive")
+    _require_positive_integer(count, name="count")
     available = end_frame - start_frame + 1
     count = min(int(count), available)
     if count == available:
@@ -125,10 +128,8 @@ def _window_sample_indices(
     window: TimeWindow,
     num_frames: int,
 ) -> list[int]:
-    if num_frames <= 0:
-        raise ValueError("num_frames must be positive")
-    if frame_count <= 0:
-        raise ValueError("frame_count must be positive")
+    _require_positive_integer(num_frames, name="num_frames")
+    _require_positive_integer(frame_count, name="frame_count")
     w = window.clamp(duration)
     start_frame = min(frame_count - 1, max(0, int(math.floor(w.start * fps))))
     end_frame = min(
@@ -149,8 +150,7 @@ def _scan_indices(
 
     if not math.isfinite(scan_fps) or scan_fps <= 0:
         raise ValueError("scan_fps must be finite and positive")
-    if max_frames <= 0:
-        raise ValueError("max_frames must be positive")
+    _require_positive_integer(max_frames, name="max_frames")
     step = max(1, int(round(fps / float(scan_fps))))
     indices = list(range(0, frame_count, step))
     if indices[-1] != frame_count - 1:
@@ -175,10 +175,8 @@ def _visual_change_scan(
 
     import numpy as np
 
-    if thumbnail_side <= 0:
-        raise ValueError("thumbnail_side must be positive")
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive")
+    _require_positive_integer(thumbnail_side, name="thumbnail_side")
+    _require_positive_integer(batch_size, name="batch_size")
 
     indices = _scan_indices(
         frame_count=frame_count,

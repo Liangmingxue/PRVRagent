@@ -150,6 +150,13 @@ def test_retriever_rejects_invalid_fusion_weights():
         DreamPRVRAdapter(FakeModel(), _context(), clip_scale_weight=-1.0, frame_scale_weight=1.0)
 
 
+def test_retriever_rejects_non_integer_top_k():
+    adapter = DreamPRVRAdapter(FakeModel(), _context())
+    for top_k in (True, 1.5):
+        with pytest.raises(ValueError, match="positive integer"):
+            adapter.retrieve(torch.tensor([[1.0, 0.0]]), None, top_k=top_k)
+
+
 def test_retriever_rejects_bad_video_mask_shape():
     context = _context()
     context["video_mask"] = torch.ones(2, 3)

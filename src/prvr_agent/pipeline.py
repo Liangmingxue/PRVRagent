@@ -60,6 +60,25 @@ class PipelineConfig:
     scoring: ProspectiveConfig = ProspectiveConfig()
 
     def validate(self) -> None:
+        positive_integer_fields = (
+            "num_worlds",
+            "frames_per_chunk",
+            "max_chunks",
+            "chunks_per_request",
+            "sidekick_max_frames",
+            "refinement_frames_per_chunk",
+            "confirmation_frames",
+            "confirmation_max_segments",
+        )
+        for name in positive_integer_fields:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        for name in ("context_radius", "max_refinement_chunks"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+
         if not 1 <= self.num_worlds <= MAX_EVENT_WORLDS:
             raise ValueError(f"num_worlds must be in [1, {MAX_EVENT_WORLDS}]")
         if not 1 <= self.frames_per_chunk <= MAX_FRAMES_PER_CHUNK:

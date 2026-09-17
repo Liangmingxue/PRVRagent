@@ -111,3 +111,18 @@ def test_bridge_can_limit_queries_for_local_vlm_smoke_tests():
     )
     assert result.base_scores.shape == (1, 3)
     assert result.query_ids == ("v0#0",)
+
+
+def test_bridge_rejects_non_integer_query_and_shortlist_limits():
+    common = dict(
+        model=FakeDreamPRVR(),
+        query_loader=FakeQueryLoader(),
+        context_info=_context(),
+        reranker=ReverseShortlistReranker(),
+        clip_scale_weight=0.5,
+        frame_scale_weight=0.5,
+    )
+    with pytest.raises(ValueError, match="top_k must be a positive integer"):
+        rerank_dreamprvr_query_loader(**common, top_k=True)
+    with pytest.raises(ValueError, match="max_queries must be a positive integer"):
+        rerank_dreamprvr_query_loader(**common, top_k=2, max_queries=1.5)

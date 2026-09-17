@@ -258,8 +258,8 @@ class DreamPRVRAdapter:
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("DreamPRVRAdapter requires the optional 'torch' dependency") from exc
 
-        if top_k <= 0:
-            raise ValueError("top_k must be positive")
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+            raise ValueError("top_k must be a positive integer")
 
         had_training_attr = hasattr(self.model, "training")
         was_training = bool(getattr(self.model, "training", False))
