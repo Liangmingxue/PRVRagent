@@ -74,20 +74,25 @@ class OpenAIFrameEvidenceBackend:
         schema = EvidenceResult.model_json_schema()
         graph_json = graph.model_dump_json(indent=2)
         task = (
-            "Search for evidence that the positive hypothesis is fully satisfied."
+            "Search for evidence that the positive hypothesis is fully satisfied. "
+            "support measures evidence for the positive hypothesis; contradiction measures evidence against it."
             if mode == "support"
-            else "Act as a falsifier: search for counterfactual or contradictory evidence showing this is a semantic near-miss."
+            else "Act as a falsifier: search for counterfactual or contradictory evidence showing this is a semantic near-miss. "
+            "support measures evidence FOR a counterfactual (against the query); contradiction measures evidence "
+            "AGAINST that counterfactual (not against the query). Absence of an event in these sampled frames alone "
+            "does not prove that the event is absent from the video."
         )
         content: list[dict] = [
             {
                 "type": "text",
                 "text": (
                     f"PRVR query: {query}\nCandidate video: {candidate.video_id}\n"
-                    f"Inspection window: {window.start:.2f}s-{window.end:.2f}s\nMode: {mode}\n"
+                    f"Sampled frame range: {min(timestamps):.2f}s-{max(timestamps):.2f}s\nMode: {mode}\n"
                     f"Task: {task}\nHypothesis graph:\n{graph_json}\n\n"
                     "Evaluate only observable evidence. Do not infer hidden intent or unseen causes. "
                     "Return calibrated support/contradiction values and explicitly judge event completeness, "
-                    "entity consistency, and temporal consistency."
+                    "entity consistency, and temporal consistency. Use only event ids from the supplied graph. "
+                    "Any reported evidence times must fall within the sampled frame range."
                 ),
             }
         ]
@@ -107,5 +112,8 @@ class OpenAIFrameEvidenceBackend:
         raw = response.choices[0].message.content or "{}"
         result = EvidenceResult.model_validate_json(raw)
         if result.mode != mode:
-            result = result.model_copy(update={"mode": mode})
+            raise ValueError(f"Verifier returned mode {result.mode!r} for requested mode {mode!r}")
+        event_ids = {event.id for event in graph.atomic_events}
+        if not set(result.verified_event_ids).issubset(event_ids):
+            raise ValueError("Verifier returned event ids that are not in the hypothesis graph")
         return result
