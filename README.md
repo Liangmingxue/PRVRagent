@@ -140,6 +140,15 @@ cfg = PipelineConfig(
 
 ## Status
 
+### Input and scoring guarantees
+
+- Verification budgets require a positive integer number of rounds; sampling counts and top-K limits also require positive integers. Invalid budgets fail before any candidate can be silently dropped.
+- Feature tensors must have shape `[video, location, dim]`, with non-empty locations and dimensions, and their video count must match the supplied video IDs.
+- Sampling clamps windows to the video bounds, including windows starting at or beyond the end. Empty videos and invalid FPS are rejected.
+- Every candidate uses `base_weight * base_score` as its retrieval contribution. Candidates outside `top_k_verify` have no evidence contribution and retain `rounds=0`, `uncertainty=1.0`.
+- In refute mode, `support` measures evidence for a counterfactual and `contradiction` measures evidence against that counterfactual. A response with the wrong mode or unknown event IDs is rejected instead of silently reinterpreted.
+- Hypothesis graphs require non-empty events and unique event/counterfactual IDs. Candidate scores and evidence timestamps must be finite; indices and timestamps cannot be negative.
+
 This is an audited **MVP research scaffold**, not yet a reproduction package. Before reporting benchmark numbers, the next required steps are:
 
 - add benchmark-specific video-id -> path resolution and exact feature-index -> timestamp mappings;

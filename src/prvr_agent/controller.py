@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
 
 from .reranker import VerificationScore
 from .schemas import Candidate, EvidenceResult
@@ -14,6 +15,20 @@ class VerificationBudgetConfig:
     early_stop_uncertainty: float = 0.18
     peak_disagreement_seconds_scale: float = 0.10
     retrieval_margin_scale: float = 0.20
+
+    def __post_init__(self) -> None:
+        if isinstance(self.max_rounds, bool) or not isinstance(self.max_rounds, int) or self.max_rounds <= 0:
+            raise ValueError("max_rounds must be a positive integer")
+        for name in ("initial_window_seconds", "retrieval_margin_scale"):
+            value = getattr(self, name)
+            if not isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not isfinite(self.expansion_factor) or self.expansion_factor <= 1:
+            raise ValueError("expansion_factor must be finite and greater than 1")
+        if not isfinite(self.early_stop_uncertainty) or not 0 <= self.early_stop_uncertainty <= 1:
+            raise ValueError("early_stop_uncertainty must be between 0 and 1")
+        if not isfinite(self.peak_disagreement_seconds_scale) or self.peak_disagreement_seconds_scale < 0:
+            raise ValueError("peak_disagreement_seconds_scale must be finite and non-negative")
 
 
 @dataclass

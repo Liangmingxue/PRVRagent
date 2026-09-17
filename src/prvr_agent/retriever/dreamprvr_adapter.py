@@ -31,11 +31,20 @@ class DreamPRVRAdapter:
     ) -> None:
         self.model = model
         self.context_info = context_info
-        self.video_ids = list(video_ids or context_info.get("video_metas") or [])
+        resolved_ids = video_ids if video_ids is not None else context_info.get("video_metas")
+        self.video_ids = list(resolved_ids) if resolved_ids is not None else []
         self.clip_scale_weight = float(clip_scale_weight)
         self.frame_scale_weight = float(frame_scale_weight)
         if not self.video_ids:
             raise ValueError("video_ids or context_info['video_metas'] is required")
+        for name in ("video_proposal_feat", "video_feat"):
+            if name not in context_info:
+                raise ValueError(f"context_info[{name!r}] is required")
+            features = context_info[name]
+            if features.ndim != 3 or features.shape[1] == 0 or features.shape[2] == 0:
+                raise ValueError(f"{name} must have shape [video, location, dim] with non-empty locations and dimensions")
+            if features.shape[0] != len(self.video_ids):
+                raise ValueError(f"{name} video count must match video_ids")
 
     @staticmethod
     def _scores_and_peaks(query_vectors, context_features):
@@ -47,10 +56,14 @@ class DreamPRVRAdapter:
 
         if query_vectors.ndim == 1:
             query_vectors = query_vectors.unsqueeze(0)
+        if query_vectors.ndim != 2:
+            raise ValueError("query vectors must have shape [query, dim]")
         if context_features.ndim != 3:
             raise ValueError(
                 f"Expected inference context with shape [video, location, dim], got {tuple(context_features.shape)}"
             )
+        if query_vectors.shape[-1] != context_features.shape[-1]:
+            raise ValueError("query and context feature dimensions must match")
         q = F.normalize(query_vectors, dim=-1)
         ctx = F.normalize(context_features, dim=-1)
         location_scores = torch.einsum("qd,vld->qvl", q, ctx)
@@ -62,8 +75,8 @@ class DreamPRVRAdapter:
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("DreamPRVRAdapter requires the optional 'torch' dependency") from exc
 
-        if top_k <= 0:
-            raise ValueError("top_k must be positive")
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+            raise ValueError("top_k must be a positive integer")
         with torch.no_grad():
             query_vectors = self.model.encode_query(query_feat, query_mask)
             clip_scores, clip_peaks = self._scores_and_peaks(

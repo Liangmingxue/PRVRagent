@@ -40,7 +40,7 @@ class CounterfactualHypothesis(BaseModel):
 
 class QueryHypothesisGraph(BaseModel):
     query: str
-    atomic_events: list[AtomicEvent]
+    atomic_events: list[AtomicEvent] = Field(min_length=1)
     temporal_constraints: list[TemporalConstraint] = Field(default_factory=list)
     identity_constraints: list[IdentityConstraint] = Field(default_factory=list)
     positive_hypothesis: str
@@ -49,6 +49,10 @@ class QueryHypothesisGraph(BaseModel):
     @model_validator(mode="after")
     def validate_references(self) -> "QueryHypothesisGraph":
         ids = {e.id for e in self.atomic_events}
+        if len(ids) != len(self.atomic_events):
+            raise ValueError("Atomic event ids must be unique")
+        if len({c.id for c in self.counterfactuals}) != len(self.counterfactuals):
+            raise ValueError("Counterfactual ids must be unique")
         for rel in self.temporal_constraints:
             if rel.event_a not in ids or rel.event_b not in ids:
                 raise ValueError("Temporal constraints must reference existing atomic event ids")
@@ -60,12 +64,12 @@ class QueryHypothesisGraph(BaseModel):
 
 class Candidate(BaseModel):
     video_id: str
-    video_index: int
-    base_score: float
-    clip_score: float
-    frame_score: float
-    clip_peak_index: int
-    frame_peak_index: int
+    video_index: int = Field(ge=0)
+    base_score: float = Field(allow_inf_nan=False)
+    clip_score: float = Field(allow_inf_nan=False)
+    frame_score: float = Field(allow_inf_nan=False)
+    clip_peak_index: int = Field(ge=0)
+    frame_peak_index: int = Field(ge=0)
     metadata: dict = Field(default_factory=dict)
 
 
@@ -74,8 +78,8 @@ class EvidenceResult(BaseModel):
     matched: bool
     support: float = Field(ge=0.0, le=1.0)
     contradiction: float = Field(ge=0.0, le=1.0)
-    start_time: float | None = None
-    end_time: float | None = None
+    start_time: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    end_time: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     observations: list[str] = Field(default_factory=list)
     verified_event_ids: list[str] = Field(default_factory=list)
     verified_relation_ids: list[str] = Field(default_factory=list)

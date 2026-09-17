@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from typing import Callable
 
@@ -22,7 +23,7 @@ class PeakMappingConfig:
             ("frame_seconds_per_index", self.frame_seconds_per_index),
             ("clip_seconds_per_index", self.clip_seconds_per_index),
         ):
-            if value is None or value <= 0:
+            if value is None or not isfinite(value) or value <= 0:
                 raise ValueError(
                     f"{name} must be configured from the dataset feature-extraction pipeline before verification"
                 )
@@ -59,10 +60,10 @@ class PRVRAgentReranker:
         self.video_path_resolver = video_path_resolver
         self.cfg = cfg or PipelineConfig()
         self.cfg.peak_mapping.validate()
-        if self.cfg.top_k_verify <= 0:
-            raise ValueError("top_k_verify must be positive")
-        if self.cfg.frames_per_round <= 0:
-            raise ValueError("frames_per_round must be positive")
+        for name in ("top_k_verify", "frames_per_round"):
+            value = getattr(self.cfg, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
 
     def _peak_times(self, candidate: Candidate) -> tuple[float, float]:
         mapping = self.cfg.peak_mapping
@@ -149,7 +150,7 @@ class PRVRAgentReranker:
             output.append(
                 RerankedCandidate(
                     candidate=candidate,
-                    final_score=candidate.base_score,
+                    final_score=self.cfg.fusion.base_weight * candidate.base_score,
                     rounds=0,
                     uncertainty=1.0,
                 )
